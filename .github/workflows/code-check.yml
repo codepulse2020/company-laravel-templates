@@ -1,0 +1,46 @@
+name: Reusable Code Check
+
+on:
+  workflow_call:
+    inputs:
+      agents:
+        description: "Which checks to run (comma separated)"
+        required: false
+        type: string
+        default: "eslint,unit"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      agents: ${{ steps.set-agents.outputs.agents }}
+    steps:
+      - id: set-agents
+        run: |
+          VALUE="${{ inputs.agents }}"
+          VALUE=$(echo "$VALUE" | tr 'A-Z' 'a-z' | tr -d ' ')
+          echo "agents=$VALUE" >> $GITHUB_OUTPUT
+
+  eslint:
+    needs: prepare
+    if: contains(needs.prepare.outputs.agents, 'eslint')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run lint
+
+  unit:
+    needs: prepare
+    if: contains(needs.prepare.outputs.agents, 'unit')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm test
