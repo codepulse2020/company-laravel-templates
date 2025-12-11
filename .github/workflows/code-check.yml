@@ -28,12 +28,26 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       agents: ${{ steps.set-agents.outputs.agents }}
+      role: ${{ steps.set-params.outputs.role }}
+      ai_rule_modules: ${{ steps.set-params.outputs.ai_rule_modules }}
     steps:
       - id: set-agents
         run: |
           VALUE="${{ inputs.agents }}"
           VALUE=$(echo "$VALUE" | tr 'A-Z' 'a-z' | tr -d ' ')
           echo "agents=$VALUE" >> $GITHUB_OUTPUT
+
+      - id: set-params
+        run: |
+          ROLE="${{ inputs.role }}"
+          # 根據 role 選擇要使用的規則模組清單
+          if [ "$ROLE" = "frontend" ]; then
+            AI_RULE_MODULES="${{ inputs.ai_frontend_rule_modules }}"
+          else
+            AI_RULE_MODULES="${{ inputs.ai_backend_rule_modules }}"
+          fi
+          echo "role=$ROLE" >> $GITHUB_OUTPUT
+          echo "ai_rule_modules=$AI_RULE_MODULES" >> $GITHUB_OUTPUT
 
   eslint:
     needs: prepare
@@ -72,15 +86,32 @@ jobs:
       # 1. Checkout 專案本身，用來抓 diff
       - name: Checkout target repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Get diff vs main
+      - name: Get diff vs default branch (robust)
         id: diff
         run: |
-          git fetch origin main
-          DIFF=$(git diff origin/main...HEAD)
+          set -e
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+
+          # 確保有足夠歷史可找 merge-base
+          git fetch --depth=0 origin "$DEFAULT_BRANCH" || true
+
+          # 嘗試使用三點差異（需要 merge-base）
+          if git merge-base HEAD origin/"$DEFAULT_BRANCH" >/dev/null 2>&1 ; then
+            DIFF=$(git diff origin/"$DEFAULT_BRANCH"...HEAD)
+          else
+            echo "No merge-base. Falling back to two-dot diff"
+            DIFF=$(git diff origin/"$DEFAULT_BRANCH"..HEAD || true)
+            if [ -z "$DIFF" ]; then
+              echo "Fallback to last-commit diff"
+              DIFF=$(git diff HEAD^..HEAD || true)
+            fi
+          fi
           echo "$DIFF" > diff.txt
           JSON_DIFF=$(printf '%s' "$DIFF" | jq -Rs .)
           echo "json_diff=$JSON_DIFF" >> $GITHUB_OUTPUT
@@ -89,32 +120,38 @@ jobs:
       - name: Checkout CI templates repo
         uses: actions/checkout@v4
         with:
-          repository: your-org/company-ci-templates   # ← 改成你自己的 org/repo
-          path: ci-templates
+          repository: codepulse2020/company-laravel-templates   # ← 改成你自己的 org/repo
+          path: laravel-templates
 
       # 3. 根據 ai_rule_modules 一個一個把 md 內容串起來
       - name: Build AI rules from modules
         id: rules
         run: |
-          cd ci-templates
+          cd laravel-templates
           
           RULE_TEXT=""
           
-          IFS=',' read -ra MODULES <<< "$AI_RULE_MODULES"
-          for MODULE in "${MODULES[@]}"; do
-            FILE="ai-rules/${MODULE}.md"
-            if [ -f "$FILE" ]; then
-              echo "使用規則模組: $FILE"
-              RULE_TEXT="${RULE_TEXT}\n\n===== MODULE: ${MODULE} =====\n\n$(cat "$FILE")"
-            else
-              echo "找不到規則模組檔案: $FILE，略過"
+          IFS=',' read -ra MODULE_PATTERNS <<< "$AI_RULE_MODULES"
+          for PATTERN in "${MODULE_PATTERNS[@]}"; do
+            # 展開通配符合的檔案清單
+            MATCHED=0
+            for FILE in ai-rules/${PATTERN}.md; do
+              if [ -f "$FILE" ]; then
+                MODULE_NAME=$(basename "$FILE" .md)
+                echo "使用規則模組: $FILE"
+                RULE_TEXT="${RULE_TEXT}\n\n===== MODULE: ${MODULE_NAME} =====\n\n$(cat "$FILE")"
+                MATCHED=1
+              fi
+            done
+            if [ "$MATCHED" -eq 0 ]; then
+              echo "找不到規則模組檔案: ai-rules/${PATTERN}.md，略過"
             fi
           done
           
-          # 如果全部都沒找到，就使用 backend-default.md
-          if [ -z "$RULE_TEXT" ] && [ -f "ai-rules/backend-default.md" ]; then
-            echo "沒有任何模組載入，改用 backend-default.md"
-            RULE_TEXT="$(cat ai-rules/backend-default.md)"
+          # 如果全部都沒找到，就使用存在的預設檔案（改用 backend-main.md）
+          if [ -z "$RULE_TEXT" ] && [ -f "ai-rules/backend-main.md" ]; then
+            echo "沒有任何模組載入，改用 backend-main.md"
+            RULE_TEXT="$(cat ai-rules/backend-main.md)"
           fi
           
           echo -e "$RULE_TEXT" > merged-rules.txt
