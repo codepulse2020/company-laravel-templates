@@ -2,6 +2,13 @@ name: Reusable Code Check
 
 on:
   workflow_call:
+    secrets:
+      CI_TEMPLATES_READ_TOKEN:
+        description: PAT with read access to the templates repo (used when templates_auth=token)
+        required: false
+      CI_TEMPLATES_SSH_KEY:
+        description: Read-only deploy SSH private key for the templates repo (used when templates_auth=ssh)
+        required: false
     inputs:
       agents:
         description: "Which checks to run (comma separated)"
@@ -38,16 +45,6 @@ on:
         required: false
         type: string
         default: "token"
-      templates_token_secret_name:
-        description: "Secret name that stores a PAT with read access to templates repo"
-        required: false
-        type: string
-        default: "CI_TEMPLATES_READ_TOKEN"
-      templates_ssh_key_secret_name:
-        description: "Secret name that stores a read-only deploy SSH key for templates repo"
-        required: false
-        type: string
-        default: "CI_TEMPLATES_SSH_KEY"
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -162,15 +159,15 @@ jobs:
         run: |
           AUTH="${{ inputs.templates_auth }}"
           if [ "$AUTH" = "token" ]; then
-            if [ -z "${{ secrets[inputs.templates_token_secret_name] }}" ]; then
-              echo "Missing secret '${{ inputs.templates_token_secret_name }}' required for token auth to checkout '${{ inputs.templates_repo }}'." >&2
-              echo "Please add a PAT with read access as this secret in the caller repository, or set 'templates_auth: ssh' and provide '${{ inputs.templates_ssh_key_secret_name }}'." >&2
+            if [ -z "${{ secrets.CI_TEMPLATES_READ_TOKEN }}" ]; then
+              echo "Missing secret 'CI_TEMPLATES_READ_TOKEN' required for token auth to checkout '${{ inputs.templates_repo }}'." >&2
+              echo "Please add a PAT with read access as this secret in the caller repository, or set 'templates_auth: ssh' and provide 'CI_TEMPLATES_SSH_KEY'." >&2
               exit 1
             fi
           elif [ "$AUTH" = "ssh" ]; then
-            if [ -z "${{ secrets[inputs.templates_ssh_key_secret_name] }}" ]; then
-              echo "Missing secret '${{ inputs.templates_ssh_key_secret_name }}' required for SSH auth to checkout '${{ inputs.templates_repo }}'." >&2
-              echo "Please add a read-only deploy key as this secret in the caller repository, or set 'templates_auth: token' and provide '${{ inputs.templates_token_secret_name }}'." >&2
+            if [ -z "${{ secrets.CI_TEMPLATES_SSH_KEY }}" ]; then
+              echo "Missing secret 'CI_TEMPLATES_SSH_KEY' required for SSH auth to checkout '${{ inputs.templates_repo }}'." >&2
+              echo "Please add a read-only deploy key as this secret in the caller repository, or set 'templates_auth: token' and provide 'CI_TEMPLATES_READ_TOKEN'." >&2
               exit 1
             fi
           else
@@ -180,21 +177,21 @@ jobs:
 
       # 2. Checkout 共用 CI repo，讀 ai-rules/*.md
       - name: Checkout CI templates repo (token)
-        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'token' && secrets[inputs.templates_token_secret_name] != '' }}
+        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'token' && secrets.CI_TEMPLATES_READ_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.templates_repo }}
           ref: ${{ inputs.templates_ref }}
-          token: ${{ secrets[inputs.templates_token_secret_name] }}
+          token: ${{ secrets.CI_TEMPLATES_READ_TOKEN }}
           path: laravel-templates
 
       - name: Checkout CI templates repo (ssh)
-        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'ssh' && secrets[inputs.templates_ssh_key_secret_name] != '' }}
+        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'ssh' && secrets.CI_TEMPLATES_SSH_KEY != '' }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.templates_repo }}
           ref: ${{ inputs.templates_ref }}
-          ssh-key: ${{ secrets[inputs.templates_ssh_key_secret_name] }}
+          ssh-key: ${{ secrets.CI_TEMPLATES_SSH_KEY }}
           path: laravel-templates
 
       # 3. 根據 ai_rule_modules 一個一個把 md 內容串起來
