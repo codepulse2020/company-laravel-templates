@@ -23,6 +23,31 @@ on:
         required: false
         type: string
         default: "frontend-*"
+      templates_repo:
+        description: "CI templates repo slug (owner/repo)"
+        required: false
+        type: string
+        default: "codepulse2020/company-laravel-templates"
+      templates_ref:
+        description: "Ref (branch/tag/sha) for templates repo to avoid default-branch lookup"
+        required: false
+        type: string
+        default: "main"
+      templates_auth:
+        description: "Auth method to checkout templates repo (token|ssh)"
+        required: false
+        type: string
+        default: "token"
+      templates_token_secret_name:
+        description: "Secret name that stores a PAT with read access to templates repo"
+        required: false
+        type: string
+        default: "CI_TEMPLATES_READ_TOKEN"
+      templates_ssh_key_secret_name:
+        description: "Secret name that stores a read-only deploy SSH key for templates repo"
+        required: false
+        type: string
+        default: "CI_TEMPLATES_SSH_KEY"
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -116,18 +141,74 @@ jobs:
           JSON_DIFF=$(printf '%s' "$DIFF" | jq -Rs .)
           echo "json_diff=$JSON_DIFF" >> $GITHUB_OUTPUT
 
+      # Decide whether we need to checkout the external templates repo for ai-rules
+      - name: Decide rules source
+        id: decide
+        run: |
+          USE_TEMPLATES="false"
+          if [ "${{ github.repository }}" = "${{ inputs.templates_repo }}" ]; then
+            echo "Running inside templates repo; will use local ai-rules" >&2
+          elif [ -d "ai-rules" ]; then
+            echo "Local ai-rules found in target repo; skip external checkout" >&2
+          else
+            USE_TEMPLATES="true"
+            echo "No local ai-rules found; will checkout templates repo" >&2
+          fi
+          echo "use_templates=$USE_TEMPLATES" >> $GITHUB_OUTPUT
+
+      # If we need templates, ensure the selected auth has a secret configured
+      - name: Validate templates checkout credentials
+        if: ${{ steps.decide.outputs.use_templates == 'true' }}
+        run: |
+          AUTH="${{ inputs.templates_auth }}"
+          if [ "$AUTH" = "token" ]; then
+            if [ -z "${{ secrets[inputs.templates_token_secret_name] }}" ]; then
+              echo "Missing secret '${{ inputs.templates_token_secret_name }}' required for token auth to checkout '${{ inputs.templates_repo }}'." >&2
+              echo "Please add a PAT with read access as this secret in the caller repository, or set 'templates_auth: ssh' and provide '${{ inputs.templates_ssh_key_secret_name }}'." >&2
+              exit 1
+            fi
+          elif [ "$AUTH" = "ssh" ]; then
+            if [ -z "${{ secrets[inputs.templates_ssh_key_secret_name] }}" ]; then
+              echo "Missing secret '${{ inputs.templates_ssh_key_secret_name }}' required for SSH auth to checkout '${{ inputs.templates_repo }}'." >&2
+              echo "Please add a read-only deploy key as this secret in the caller repository, or set 'templates_auth: token' and provide '${{ inputs.templates_token_secret_name }}'." >&2
+              exit 1
+            fi
+          else
+            echo "Invalid templates_auth value: '${{ inputs.templates_auth }}'. Expected 'token' or 'ssh'." >&2
+            exit 1
+          fi
+
       # 2. Checkout 共用 CI repo，讀 ai-rules/*.md
-      - name: Checkout CI templates repo
+      - name: Checkout CI templates repo (token)
+        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'token' && secrets[inputs.templates_token_secret_name] != '' }}
         uses: actions/checkout@v4
         with:
-          repository: codepulse2020/company-laravel-templates   # ← 改成你自己的 org/repo
+          repository: ${{ inputs.templates_repo }}
+          ref: ${{ inputs.templates_ref }}
+          token: ${{ secrets[inputs.templates_token_secret_name] }}
+          path: laravel-templates
+
+      - name: Checkout CI templates repo (ssh)
+        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'ssh' && secrets[inputs.templates_ssh_key_secret_name] != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repo }}
+          ref: ${{ inputs.templates_ref }}
+          ssh-key: ${{ secrets[inputs.templates_ssh_key_secret_name] }}
           path: laravel-templates
 
       # 3. 根據 ai_rule_modules 一個一個把 md 內容串起來
       - name: Build AI rules from modules
         id: rules
         run: |
-          cd laravel-templates
+          if [ -d "laravel-templates/ai-rules" ]; then
+            cd laravel-templates
+          elif [ -d "ai-rules" ]; then
+            echo "Using local ai-rules in current repo"
+          else
+            echo "ai-rules directory not found in either laravel-templates or current repo" >&2
+            exit 1
+          fi
           
           RULE_TEXT=""
           
