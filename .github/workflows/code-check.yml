@@ -167,30 +167,39 @@ jobs:
           echo "use_templates=$USE_TEMPLATES" >> $GITHUB_OUTPUT
 
       # If we need templates, ensure the selected auth has a secret configured
-      - name: Validate templates checkout credentials
+      - name: Validate templates checkout credentials (with public fallback)
+        id: creds
         if: ${{ steps.decide.outputs.use_templates == 'true' }}
         run: |
           AUTH="${{ inputs.templates_auth }}"
-          if [ "$AUTH" = "token" ]; then
-            if [ -z "${{ secrets.CI_TEMPLATES_READ_TOKEN }}" ]; then
-              echo "Missing secret 'CI_TEMPLATES_READ_TOKEN' required for token auth to checkout '${{ inputs.templates_repo }}'." >&2
-              echo "Please add a PAT with read access as this secret in the caller repository, or set 'templates_auth: ssh' and provide 'CI_TEMPLATES_SSH_KEY'." >&2
+          USE_PUBLIC_FALLBACK="false"
+          case "$AUTH" in
+            token)
+              if [ -z "${{ secrets.CI_TEMPLATES_READ_TOKEN }}" ]; then
+                echo "CI_TEMPLATES_READ_TOKEN is missing; will try public fallback clone." >&2
+                USE_PUBLIC_FALLBACK="true"
+              fi
+              ;;
+            ssh)
+              if [ -z "${{ secrets.CI_TEMPLATES_SSH_KEY }}" ]; then
+                echo "CI_TEMPLATES_SSH_KEY is missing; will try public fallback clone." >&2
+                USE_PUBLIC_FALLBACK="true"
+              fi
+              ;;
+            public)
+              echo "templates_auth=public; will use unauthenticated public clone." >&2
+              USE_PUBLIC_FALLBACK="true"
+              ;;
+            *)
+              echo "Invalid templates_auth value: '${{ inputs.templates_auth }}'. Expected 'token', 'ssh', or 'public'." >&2
               exit 1
-            fi
-          elif [ "$AUTH" = "ssh" ]; then
-            if [ -z "${{ secrets.CI_TEMPLATES_SSH_KEY }}" ]; then
-              echo "Missing secret 'CI_TEMPLATES_SSH_KEY' required for SSH auth to checkout '${{ inputs.templates_repo }}'." >&2
-              echo "Please add a read-only deploy key as this secret in the caller repository, or set 'templates_auth: token' and provide 'CI_TEMPLATES_READ_TOKEN'." >&2
-              exit 1
-            fi
-          else
-            echo "Invalid templates_auth value: '${{ inputs.templates_auth }}'. Expected 'token' or 'ssh'." >&2
-            exit 1
-          fi
+              ;;
+          esac
+          echo "use_public_fallback=$USE_PUBLIC_FALLBACK" >> $GITHUB_OUTPUT
 
       # 2. Checkout 共用 CI repo，讀 ai-rules/*.md
       - name: Checkout CI templates repo (token)
-        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'token' }}
+        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'token' && steps.creds.outputs.use_public_fallback != 'true' }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.templates_repo }}
@@ -199,13 +208,42 @@ jobs:
           path: laravel-templates
 
       - name: Checkout CI templates repo (ssh)
-        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'ssh' }}
+        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'ssh' && steps.creds.outputs.use_public_fallback != 'true' }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.templates_repo }}
           ref: ${{ inputs.templates_ref }}
           ssh-key: ${{ secrets.CI_TEMPLATES_SSH_KEY }}
           path: laravel-templates
+
+      - name: Public fallback checkout (no credentials)
+        if: ${{ steps.decide.outputs.use_templates == 'true' && steps.creds.outputs.use_public_fallback == 'true' }}
+        run: |
+          set -e
+          REPO="${{ inputs.templates_repo }}"
+          REF="${{ inputs.templates_ref }}"
+          echo "Attempt unauthenticated public clone for $REPO@$REF" >&2
+          if [ -d "laravel-templates/ai-rules" ]; then
+            echo "laravel-templates/ai-rules already present, skip clone"
+            exit 0
+          fi
+          if command -v git >/dev/null 2>&1; then
+            git clone --depth=1 --branch "$REF" "https://github.com/${REPO}.git" laravel-templates || true
+          fi
+          if [ ! -d "laravel-templates/ai-rules" ]; then
+            echo "git clone failed or ai-rules not found, try tarball download" >&2
+            mkdir -p _dl && cd _dl
+            curl -sSL "https://codeload.github.com/${REPO}/tar.gz/${REF}" -o repo.tgz
+            tar xzf repo.tgz
+            TOPDIR=$(tar tzf repo.tgz | head -1 | cut -f1 -d"/")
+            cd ..
+            rm -rf laravel-templates
+            mv "_dl/${TOPDIR}" laravel-templates || true
+          fi
+          if [ ! -d "laravel-templates/ai-rules" ]; then
+            echo "Public fallback failed: ai-rules not found in ${REPO}@${REF}" >&2
+            exit 1
+          fi
 
       # 3. 根據 ai_rule_modules 一個一個把 md 內容串起來
       - name: Build AI rules from modules
