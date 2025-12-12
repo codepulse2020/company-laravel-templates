@@ -9,6 +9,9 @@ on:
       CI_TEMPLATES_SSH_KEY:
         description: Read-only deploy SSH private key for the templates repo (used when templates_auth=ssh)
         required: false
+      OPENAI_API_KEY:
+        description: API key for OpenAI used by the ai-review job
+        required: false
     inputs:
       agents:
         description: "Which checks to run (comma separated)"
@@ -120,6 +123,16 @@ jobs:
           set -e
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
 
+          # If default branch is not available in a reusable workflow context, try to detect it
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            git remote set-head origin -a >/dev/null 2>&1 || true
+            DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)
+          fi
+          # Final fallback
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            DEFAULT_BRANCH="main"
+          fi
+
           # 確保有足夠歷史可找 merge-base
           git fetch --depth=0 origin "$DEFAULT_BRANCH" || true
 
@@ -177,7 +190,7 @@ jobs:
 
       # 2. Checkout 共用 CI repo，讀 ai-rules/*.md
       - name: Checkout CI templates repo (token)
-        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'token' && secrets.CI_TEMPLATES_READ_TOKEN != '' }}
+        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'token' }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.templates_repo }}
@@ -186,7 +199,7 @@ jobs:
           path: laravel-templates
 
       - name: Checkout CI templates repo (ssh)
-        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'ssh' && secrets.CI_TEMPLATES_SSH_KEY != '' }}
+        if: ${{ steps.decide.outputs.use_templates == 'true' && inputs.templates_auth == 'ssh' }}
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.templates_repo }}
@@ -241,6 +254,10 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY is not provided. Please add it as a secret in the caller repository or remove 'ai' from 'agents'." >&2
+            exit 1
+          fi
           BODY=$(cat <<EOF
           {
             "model": "gpt-5-mini",
