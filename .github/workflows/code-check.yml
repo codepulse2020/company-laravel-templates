@@ -117,39 +117,82 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Get diff vs default branch (robust)
+      - name: Get diff vs base (PR/push-aware, robust)
         id: diff
         run: |
           set -e
-          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          EVENT_NAME="${{ github.event_name }}"
 
-          # If default branch is not available in a reusable workflow context, try to detect it
-          if [ -z "$DEFAULT_BRANCH" ]; then
-            git remote set-head origin -a >/dev/null 2>&1 || true
-            DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)
-          fi
-          # Final fallback
-          if [ -z "$DEFAULT_BRANCH" ]; then
-            DEFAULT_BRANCH="main"
-          fi
+          DIFF=""
+          BASE_DESC=""
+          HEAD_DESC=""
 
-          # 確保有足夠歷史可找 merge-base
-          git fetch --depth=0 origin "$DEFAULT_BRANCH" || true
-
-          # 嘗試使用三點差異（需要 merge-base）
-          if git merge-base HEAD origin/"$DEFAULT_BRANCH" >/dev/null 2>&1 ; then
-            DIFF=$(git diff origin/"$DEFAULT_BRANCH"...HEAD)
+          # Prefer PR base/head when available
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            BASE_DESC="$BASE_SHA (PR base)"
+            HEAD_DESC="$HEAD_SHA (PR head)"
+            git fetch --depth=0 origin "$BASE_SHA" || true
+            git fetch --depth=0 origin "$HEAD_SHA" || true
+            # Use three-dot to compare against merge-base
+            if git merge-base "$HEAD_SHA" "$BASE_SHA" >/dev/null 2>&1 ; then
+              DIFF=$(git diff "$BASE_SHA"..."$HEAD_SHA")
+            else
+              echo "[ai-review] PR SHAs have no merge-base. Falling back to two-dot." >&2
+              DIFF=$(git diff "$BASE_SHA".."$HEAD_SHA" || true)
+            fi
           else
-            echo "No merge-base. Falling back to two-dot diff"
-            DIFF=$(git diff origin/"$DEFAULT_BRANCH"..HEAD || true)
+            # Push or other events: use before/after SHAs if available
+            BEFORE_SHA="${{ github.event.before }}"
+            AFTER_SHA="${{ github.sha }}"
+            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+              BASE_DESC="$BEFORE_SHA (push before)"
+              HEAD_DESC="$AFTER_SHA (current)"
+              git fetch --depth=0 origin "$BEFORE_SHA" || true
+              git fetch --depth=0 origin "$AFTER_SHA" || true
+              DIFF=$(git diff "$BEFORE_SHA".."$AFTER_SHA" || true)
+            fi
+
+            # If still empty, fallback to default branch logic
             if [ -z "$DIFF" ]; then
-              echo "Fallback to last-commit diff"
-              DIFF=$(git diff HEAD^..HEAD || true)
+              DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+              if [ -z "$DEFAULT_BRANCH" ]; then
+                git remote set-head origin -a >/dev/null 2>&1 || true
+                DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)
+              fi
+              if [ -z "$DEFAULT_BRANCH" ]; then
+                DEFAULT_BRANCH="main"
+              fi
+              BASE_DESC="origin/${DEFAULT_BRANCH} (default branch)"
+              HEAD_DESC="HEAD"
+              git fetch --depth=0 origin "$DEFAULT_BRANCH" || true
+              if git merge-base HEAD origin/"$DEFAULT_BRANCH" >/dev/null 2>&1 ; then
+                DIFF=$(git diff origin/"$DEFAULT_BRANCH"...HEAD)
+              else
+                echo "[ai-review] No merge-base with default branch. Falling back to two-dot." >&2
+                DIFF=$(git diff origin/"$DEFAULT_BRANCH"..HEAD || true)
+                if [ -z "$DIFF" ]; then
+                  echo "[ai-review] Final fallback to last commit diff." >&2
+                  DIFF=$(git diff HEAD^..HEAD || true)
+                fi
+              fi
             fi
           fi
+
           echo "$DIFF" > diff.txt
           JSON_DIFF=$(printf '%s' "$DIFF" | jq -Rs .)
           echo "json_diff=$JSON_DIFF" >> $GITHUB_OUTPUT
+
+          # Outputs for later steps
+          DIFF_BYTES=$(wc -c < diff.txt | tr -d ' ')
+          if [ "$DIFF_BYTES" -eq 0 ]; then
+            echo "diff_empty=true" >> $GITHUB_OUTPUT
+          else
+            echo "diff_empty=false" >> $GITHUB_OUTPUT
+          fi
+          echo "base_ref=$BASE_DESC" >> $GITHUB_OUTPUT
+          echo "head_ref=$HEAD_DESC" >> $GITHUB_OUTPUT
 
       - name: Summarize diff
         if: always()
@@ -160,6 +203,8 @@ jobs:
             {
               echo "### AI Review · Diff"
               echo "- Diff size: ${DIFF_LEN} bytes"
+              echo "- Base: ${{ steps.diff.outputs.base_ref }}"
+              echo "- Head: ${{ steps.diff.outputs.head_ref }}"
               echo "<details><summary>Preview (first 200 chars)</summary>"
               echo
               echo '```diff'
@@ -167,6 +212,10 @@ jobs:
               echo
               echo '```'
               echo "</details>"
+              if [ "${{ steps.diff.outputs.diff_empty }}" = "true" ]; then
+                echo
+                echo "> Diff 為空：這通常表示這次提交相對於基準分支沒有變更，或事件基準偵測失敗。若你確定有變更，請確認 PR base/head 或 push 的 before/after 是否正確。"
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "[ai-review] diff.txt not found; skip summary"
@@ -340,6 +389,7 @@ jobs:
 
       # 4. 呼叫 OpenAI（或你之後自己的 AI）
       - name: Call OpenAI for AI review
+        if: ${{ steps.diff.outputs.diff_empty != 'true' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -350,6 +400,7 @@ jobs:
           BODY=$(cat <<'EOF'
           {
             "model": "gpt-5-mini",
+            "temperature": 0,
             "messages": [
               {
                 "role": "system",
@@ -373,17 +424,23 @@ jobs:
           EOF
           )
           
-          RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+          # Capture HTTP status and body separately for better diagnostics
+          HTTP_CODE=$(mktemp)
+          RESP_BODY=$(mktemp)
+          curl -s -w "%{http_code}" -o "$RESP_BODY" https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "$BODY")
-          
+            -d "$BODY" > "$HTTP_CODE"
+          STATUS=$(cat "$HTTP_CODE")
+          RESPONSE=$(cat "$RESP_BODY")
+
           CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
-          if [ -z "$CONTENT" ]; then
+          if [ -z "$CONTENT" ] || [ "$STATUS" -ge 400 ]; then
             echo "[ai-review] No content returned from OpenAI. Printing raw response snippet for debugging." >&2
             SNIPPET=$(echo "$RESPONSE" | head -c 500)
             {
               echo "### AI Review · Result"
+              echo "- HTTP status: ${STATUS}"
               echo "- Status: no content returned from provider"
               echo "<details><summary>Raw response (first 500 chars)</summary>"
               echo
