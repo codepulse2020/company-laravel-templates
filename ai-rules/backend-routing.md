@@ -1,7 +1,5 @@
 # 後端路由規範
 
-來源對應：`docs/frontend-api-multilang.md`（路由分組示例）、`docs/SECURITY.md`（中介層/限流）。
-
 ## 路由檔案與分組
 - `routes/api.php` 作為統一入口，載入子群組：
   - `Route::prefix('backend')->group(base_path('routes/backend.php'));`

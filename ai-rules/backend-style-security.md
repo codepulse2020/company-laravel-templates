@@ -1,7 +1,5 @@
 # 後端風格與安全規範
 
-來源對應：`docs/SECURITY.md`、`docs/RULES.md`（G 節）、`.env` 安全建議。
-
 ## 命名與風格
 - Controller/Action 避免模糊名稱（如 `index/getInfo` 作為萬用介面），採資源化命名。
 - 例外類型具體化（如 `AdvertisementNotFoundException`），錯誤碼集中於 `ExceptionCode`。

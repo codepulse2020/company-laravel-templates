@@ -1,7 +1,5 @@
 # 後端效能與資料庫規範
 
-來源對應：`docs/cache.md`、`docs/service.md`、`docs/repository.md`、`docs/checklist.md`。
-
 ## 快取策略（Cache）
 - Key 命名：`{domain}:{context}:{entity}:{id}:{field}:{ver}`，多租戶/多語系需帶 `tenant/locale`。
 - TTL 必填，加入 ±5% Jitter 分散過期；禁止永久快取。

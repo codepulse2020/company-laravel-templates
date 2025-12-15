@@ -1,7 +1,5 @@
 # 前端安全規範
 
-來源對應：`docs/SECURITY.md`、`docs/frontend-api-multilang.md`。
-
 ## 憑證與存放
 - JWT/固定 Token 一律放於 `Authorization: Bearer <token>` Header，不存於可被 JS 讀取之 Cookie（避免 CSRF）。
 - 若需長存，優先使用安全的記憶體狀態或受保護的儲存抽象；LocalStorage 僅在風險可接受時使用，並搭配短效 Token + 旋轉策略。

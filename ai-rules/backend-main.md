@@ -1,7 +1,5 @@
 # 後端規範總覽（分層/職責/邊界）
 
-本檔彙整專案核心分層規範，來源對應 `docs/RULES.md`、`docs/service.md`、`docs/repository.md`、`docs/validator.md`、`docs/cache.md`、`docs/constant.md`。
-
 ## 架構分層與資料流程
 - Controller（控制流程）
   - 調用 Service，組合回應；不處理交易；不直接呼叫 Repository/Model。

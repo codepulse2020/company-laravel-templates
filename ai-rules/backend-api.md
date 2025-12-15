@@ -1,7 +1,5 @@
 # 後端 API 規範（請求/回應/錯誤）
 
-來源對應：`docs/RULES.md`（E/F 節）、`docs/validator.md`、`docs/presenter.md`、`docs/api-md/README.md`。
-
 ## 請求驗證（FormRequest 必須）
 - 每個端點都有對應專屬 FormRequest（如 `AdvertisementStoreRequest`）。
 - Controller 方法參數一律注入專屬 FormRequest 型別；嚴禁注入 `Illuminate\Http\Request`。

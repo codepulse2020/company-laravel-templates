@@ -1,7 +1,5 @@
 # 前端風格規範
 
-來源對應：`docs/frontend-api-multilang.md`。
-
 ## 命名與資料分離
 - API 模組以資源命名：`ticketCategoriesApi`、`ordersApi`。
 - 元件關注點分離：容器元件（資料抓取/狀態） vs. 呈現元件（僅 props 渲染）。
