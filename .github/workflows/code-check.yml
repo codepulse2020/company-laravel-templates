@@ -151,6 +151,27 @@ jobs:
           JSON_DIFF=$(printf '%s' "$DIFF" | jq -Rs .)
           echo "json_diff=$JSON_DIFF" >> $GITHUB_OUTPUT
 
+      - name: Summarize diff
+        if: always()
+        run: |
+          if [ -f diff.txt ]; then
+            DIFF_LEN=$(wc -c < diff.txt | tr -d ' ')
+            echo "[ai-review] Diff bytes: $DIFF_LEN"
+            {
+              echo "### AI Review · Diff"
+              echo "- Diff size: ${DIFF_LEN} bytes"
+              echo "<details><summary>Preview (first 200 chars)</summary>"
+              echo
+              echo '```diff'
+              head -c 200 diff.txt || true
+              echo
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "[ai-review] diff.txt not found; skip summary"
+          fi
+
       # Decide whether we need to checkout the external templates repo for ai-rules
       - name: Decide rules source
         id: decide
@@ -287,6 +308,36 @@ jobs:
           JSON_RULES=$(printf '%s' "$RULE_TEXT" | jq -Rs .)
           echo "json_rules=$JSON_RULES" >> $GITHUB_OUTPUT
 
+      - name: Summarize rules
+        if: always()
+        run: |
+          if [ -f merged-rules.txt ]; then
+            RULES_LEN=$(wc -c < merged-rules.txt | tr -d ' ')
+            echo "[ai-review] Rules bytes: $RULES_LEN"
+            {
+              echo "### AI Review · Rules"
+              echo "- Rules size: ${RULES_LEN} bytes"
+              echo "<details><summary>Preview (first 200 chars)</summary>"
+              echo
+              echo '```markdown'
+              head -c 200 merged-rules.txt || true
+              echo
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "[ai-review] merged-rules.txt not found; skip summary"
+          fi
+
+      - name: Upload AI inputs (artifacts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-inputs
+          path: |
+            diff.txt
+            merged-rules.txt
+
       # 4. 呼叫 OpenAI（或你之後自己的 AI）
       - name: Call OpenAI for AI review
         env:
@@ -327,5 +378,31 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$BODY")
           
-          echo "=== AI Review Result ==="
-          echo "$RESPONSE" | jq -r '.choices[0].message.content'
+          CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+          if [ -z "$CONTENT" ]; then
+            echo "[ai-review] No content returned from OpenAI. Printing raw response snippet for debugging." >&2
+            SNIPPET=$(echo "$RESPONSE" | head -c 500)
+            {
+              echo "### AI Review · Result"
+              echo "- Status: no content returned from provider"
+              echo "<details><summary>Raw response (first 500 chars)</summary>"
+              echo
+              echo '```json'
+              echo "$SNIPPET"
+              echo
+              echo '```'
+              echo "</details>"
+              echo
+              echo "> 如果你看到空結果：請確認 OPENAI_API_KEY 是否有效、模型名稱是否可用、或稍後重試。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            # 仍不中止流程，避免阻斷其他檢查
+            exit 0
+          else
+            echo "=== AI Review Result ==="
+            echo "$CONTENT"
+            {
+              echo "### AI Review · Result"
+              echo
+              echo "$CONTENT"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
