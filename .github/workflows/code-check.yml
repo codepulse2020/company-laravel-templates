@@ -48,6 +48,31 @@ on:
         required: false
         type: string
         default: "token"
+      ai_fail_on_violation:
+        description: "If true, fail the job when violations are found"
+        required: false
+        type: string
+        default: "false"
+      ai_fail_min_severity:
+        description: "Minimum severity to fail on (minor|major|critical)"
+        required: false
+        type: string
+        default: "major"
+      ai_max_diff_chars:
+        description: "Max diff chars to send to AI (large diffs will be truncated)"
+        required: false
+        type: string
+        default: "50000"
+      ai_validate_key:
+        description: "在執行 AI 稽核前先做健康檢查（確認 OPENAI_API_KEY 與連線可用）"
+        required: false
+        type: string
+        default: "true"
+      ai_validation_strict:
+        description: "健康檢查失敗時是否直接失敗（true=失敗, false=僅警告）"
+        required: false
+        type: string
+        default: "false"
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -116,6 +141,70 @@ jobs:
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Validate OpenAI API key and connectivity
+        if: ${{ inputs.ai_validate_key == 'true' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          STRICT="${{ inputs.ai_validation_strict }}"
+          {
+            echo "### AI Health Check"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$OPENAI_API_KEY" ]; then
+            {
+              echo "- Result: FAIL (OPENAI_API_KEY is missing)"
+              echo "> 請在呼叫端 Repo/Org/User 的 Actions Secrets 設定 OPENAI_API_KEY，或將 agents 移除 ai。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$STRICT" = "true" ]; then
+              echo "[ai-health] Missing OPENAI_API_KEY" >&2
+              exit 1
+            else
+              exit 0
+            fi
+          fi
+
+          # 送一個最小請求做健康檢查
+          BODY=$(cat <<'EOF'
+          {"model":"gpt-5-mini","temperature":0,"max_tokens":1,
+           "messages":[{"role":"user","content":"ping"}]}
+          EOF
+          )
+
+          CODE_FILE=$(mktemp)
+          RESP_FILE=$(mktemp)
+          curl -s -w "%{http_code}" -o "$RESP_FILE" https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" > "$CODE_FILE"
+          STATUS=$(cat "$CODE_FILE")
+          RAW=$(cat "$RESP_FILE")
+          CONTENT=$(echo "$RAW" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+
+          if [ -n "$CONTENT" ] && [ "$STATUS" -lt 400 ]; then
+            {
+              echo "- HTTP status: ${STATUS}"
+              echo "- Result: OK"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            SNIPPET=$(echo "$RAW" | head -c 500)
+            {
+              echo "- HTTP status: ${STATUS}"
+              echo "- Result: FAIL"
+              echo "<details><summary>Raw response (first 500 chars)</summary>"
+              echo
+              echo '```json'
+              echo "$SNIPPET"
+              echo
+              echo '```'
+              echo "</details>"
+              echo "> 若為 401/403，請確認 API Key 與權限；429 請稍後重試；404/400 請確認模型名稱是否可用。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$STRICT" = "true" ]; then
+              exit 1
+            fi
+          fi
 
       - name: Get diff vs base (PR/push-aware, robust)
         id: diff
@@ -315,6 +404,50 @@ jobs:
             exit 1
           fi
 
+      # 3.5 依 diff 產生提示（heuristics hints）協助 AI 聚焦常見問題
+      - name: Generate AI hints from diff
+        id: hints
+        run: |
+          set -e
+          : > hints.txt
+          if [ ! -s diff.txt ]; then
+            echo "[ai-review] No diff content for hints." >&2
+          else
+            echo "# Heuristic hints from diff patterns" >> hints.txt
+            echo "" >> hints.txt
+            # 常見 Laravel/後端風險模式
+            echo "## Potential risky patterns" >> hints.txt
+            echo "" >> hints.txt
+            grep -nE "\\$request->all\\(|Illuminate\\\\Http\\\\Request|abort\\(|DB::(select|statement|raw)\\(|\\bselect \\* from\\b|->json\\(|Resource::(make|collection)\\(|meta\\.pagination|password|token" diff.txt || true >> hints.txt
+            echo "" >> hints.txt
+            echo "## Notes" >> hints.txt
+            echo "- 注意使用 FormRequest 驗證（避免 Illuminate\\\\Http\\\\Request 與 $request->all()）。" >> hints.txt
+            echo "- 應使用 Resource/Presenter 統一輸出格式，包含 meta.pagination。" >> hints.txt
+            echo "- 例外處理與錯誤碼應符合 ExceptionCode 規範，不直接 abort()。" >> hints.txt
+          fi
+          HINTS_JSON=$(jq -Rs . < hints.txt)
+          echo "json_hints=$HINTS_JSON" >> $GITHUB_OUTPUT
+          HINTS_BYTES=$(wc -c < hints.txt | tr -d ' ')
+          echo "hints_bytes=$HINTS_BYTES" >> $GITHUB_OUTPUT
+
+      - name: Summarize hints
+        if: always()
+        run: |
+          if [ -f hints.txt ]; then
+            HINTS_LEN=$(wc -c < hints.txt | tr -d ' ')
+            {
+              echo "### AI Review · Hints"
+              echo "- Hints size: ${HINTS_LEN} bytes"
+              echo "<details><summary>Preview (first 200 chars)</summary>"
+              echo
+              echo '```text'
+              head -c 200 hints.txt || true
+              echo
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # 3. 根據 ai_rule_modules 一個一個把 md 內容串起來
       - name: Build AI rules from modules
         id: rules
@@ -386,6 +519,7 @@ jobs:
           path: |
             diff.txt
             merged-rules.txt
+            hints.txt
 
       # 4. 呼叫 OpenAI（或你之後自己的 AI）
       - name: Call OpenAI for AI review
@@ -397,6 +531,19 @@ jobs:
             echo "OPENAI_API_KEY is not provided. Please add it as a secret in the caller repository or remove 'ai' from 'agents'." >&2
             exit 1
           fi
+
+          # Truncate diff if larger than configured limit to keep request within token budget
+          MAX_CHARS=${{ inputs.ai_max_diff_chars }}
+          DIFF_PAYLOAD=$(cat diff.txt)
+          DIFF_LEN=${#DIFF_PAYLOAD}
+          if [ "$DIFF_LEN" -gt "$MAX_CHARS" ]; then
+            TRUNCATED=$(head -c "$MAX_CHARS" diff.txt)
+            NOTICE="\n\n[TRUNCATED to ${MAX_CHARS} chars from ${DIFF_LEN}]"
+            JSON_DIFF_PAYLOAD=$(printf '%s' "$TRUNCATED$NOTICE" | jq -Rs .)
+          else
+            JSON_DIFF_PAYLOAD=${{ steps.diff.outputs.json_diff }}
+          fi
+
           BODY=$(cat <<'EOF'
           {
             "model": "gpt-5-mini",
@@ -404,7 +551,7 @@ jobs:
             "messages": [
               {
                 "role": "system",
-                "content": "你是本公司的後端程式碼 reviewer，請嚴格依照後面提供的公司規範來審查程式碼，並用繁體中文回覆。"
+                "content": "你是本公司的後端程式碼 reviewer。請嚴格依照公司規範審查這次變更，並用繁體中文回覆。重要：僅以 JSON 回覆，且必須符合以下 schema：{\n  \"violations\": [\n    {\n      \"rule\": string,            // 觸犯的規則或分類\n      \"severity\": \"minor|major|critical\",\n      \"file\": string,            // 嘗試從 diff 推斷，未知填 \"unknown\"\n      \"line\": number|null,       // 嘗試從 diff 推斷，未知可為 null\n      \"snippet\": string,         // 涉及的片段（可節錄）\n      \"explanation\": string,     // 問題說明與風險\n      \"fix\": string              // 具體修正建議\n    }\n  ]\n}. 嚴禁輸出 Markdown 或多餘文字，僅輸出符合 schema 的 JSON。"
               },
               {
                 "role": "system",
@@ -412,11 +559,19 @@ jobs:
               },
               {
                 "role": "user",
+                "content": "以下為針對 diff 產生的提示（僅供聚焦可能的問題點）："
+              },
+              {
+                "role": "user",
+                "content": ${{ steps.hints.outputs.json_hints }}
+              },
+              {
+                "role": "user",
                 "content": "以下是這次變更的 Git diff，請依照上述公司規範指出問題、風險與建議："
               },
               {
                 "role": "user",
-                "content": ${{ steps.diff.outputs.json_diff }}
+                "content": ${JSON_DIFF_PAYLOAD}
               }
             ],
             "max_tokens": 1000
@@ -455,11 +610,57 @@ jobs:
             # 仍不中止流程，避免阻斷其他檢查
             exit 0
           else
-            echo "=== AI Review Result ==="
-            echo "$CONTENT"
-            {
-              echo "### AI Review · Result"
-              echo
-              echo "$CONTENT"
-            } >> "$GITHUB_STEP_SUMMARY"
+            # 嘗試解析 JSON 結果
+            if echo "$CONTENT" | jq -e . >/dev/null 2>&1; then
+              echo "$CONTENT" > ai-result.json
+              VIOLATION_COUNT=$(jq '.violations | length' ai-result.json 2>/dev/null || echo 0)
+              CRIT_COUNT=$(jq '[.violations[] | select(.severity=="critical")] | length' ai-result.json 2>/dev/null || echo 0)
+              MAJOR_COUNT=$(jq '[.violations[] | select(.severity=="major")] | length' ai-result.json 2>/dev/null || echo 0)
+              MINOR_COUNT=$(jq '[.violations[] | select(.severity=="minor")] | length' ai-result.json 2>/dev/null || echo 0)
+
+              {
+                echo "### AI Review · Result"
+                echo "- Total violations: ${VIOLATION_COUNT}"
+                echo "- critical: ${CRIT_COUNT}, major: ${MAJOR_COUNT}, minor: ${MINOR_COUNT}"
+                echo "<details><summary>Top violations (up to 10)</summary>"
+                echo
+                echo '```json'
+                jq '{violations: (.violations[:10])}' ai-result.json
+                echo '```'
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              # Optional fail policy
+              FAIL_ON=${{ inputs.ai_fail_on_violation }}
+              MIN_SEV=${{ inputs.ai_fail_min_severity }}
+              if [ "$FAIL_ON" = "true" ]; then
+                THRESHOLD=0
+                case "$MIN_SEV" in
+                  critical)
+                    THRESHOLD=$CRIT_COUNT ;;
+                  major)
+                    THRESHOLD=$((CRIT_COUNT + MAJOR_COUNT)) ;;
+                  minor)
+                    THRESHOLD=$((CRIT_COUNT + MAJOR_COUNT + MINOR_COUNT)) ;;
+                  *)
+                    THRESHOLD=$((CRIT_COUNT + MAJOR_COUNT)) ;;
+                esac
+                if [ "$THRESHOLD" -gt 0 ]; then
+                  echo "[ai-review] Failing due to violations (threshold=$MIN_SEV)." >&2
+                  exit 2
+                fi
+              fi
+            else
+              echo "[ai-review] Model did not return valid JSON despite instruction. Showing raw content." >&2
+              {
+                echo "### AI Review · Result"
+                echo "- Warning: non-JSON content returned"
+                echo '<details><summary>Raw content</summary>'
+                echo
+                echo '```'
+                echo "$CONTENT"
+                echo '```'
+                echo '</details>'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
