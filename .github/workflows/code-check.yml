@@ -296,7 +296,7 @@ jobs:
             echo "OPENAI_API_KEY is not provided. Please add it as a secret in the caller repository or remove 'ai' from 'agents'." >&2
             exit 1
           fi
-          BODY=$(cat <<EOF
+          BODY=$(cat <<'EOF'
           {
             "model": "gpt-5-mini",
             "messages": [
