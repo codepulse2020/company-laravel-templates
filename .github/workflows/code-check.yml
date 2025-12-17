@@ -524,7 +524,7 @@ jobs:
             grep -nE "\\$request->all\\(|Illuminate\\\\Http\\\\Request|abort\\(|DB::(select|statement|raw)\\(|\\bselect \\* from\\b|->json\\(|Resource::(make|collection)\\(|meta\\.pagination|password|token" diff.txt || true >> hints.txt
             echo "" >> hints.txt
             echo "## Notes" >> hints.txt
-            echo "- 注意使用 FormRequest 驗證（避免 Illuminate\\\\Http\\\\Request 與 $request->all()）。" >> hints.txt
+            echo "- 注意使用 FormRequest 驗證（避免 Illuminate\\\\Http\\\\Request 與 \$request->all()）。" >> hints.txt
             echo "- 應使用 Resource/Presenter 統一輸出格式，包含 meta.pagination。" >> hints.txt
             echo "- 例外處理與錯誤碼應符合 ExceptionCode 規範，不直接 abort()。" >> hints.txt
           fi
@@ -661,6 +661,12 @@ jobs:
             CONTEXT_JSON="\"\""
           fi
 
+          # Decode JSON-string variables to raw text to pass safely via jq --arg
+          RULES_TEXT=$(printf '%s' "$RULES_JSON" | jq -r . 2>/dev/null || echo "")
+          HINTS_TEXT=$(printf '%s' "$HINTS_JSON" | jq -r . 2>/dev/null || echo "")
+          CONTEXT_TEXT=$(printf '%s' "$CONTEXT_JSON" | jq -r . 2>/dev/null || echo "")
+          DIFF_TEXT=$(printf '%s' "$DIFF_JSON" | jq -r . 2>/dev/null || echo "")
+
           # Summaries for visibility
           {
             echo "### AI Review · Payload inputs"
@@ -685,13 +691,13 @@ jobs:
             exit 0
           fi
 
-          # Build request body with jq to avoid shell interpolation issues
+          # Build request body with jq using string args to avoid invalid JSON issues
           BODY=$(jq -n \
             --arg model "gpt-5-mini" \
-            --argjson rules "$RULES_JSON" \
-            --argjson hints "$HINTS_JSON" \
-            --argjson context "$CONTEXT_JSON" \
-            --argjson diff "$DIFF_JSON" \
+            --arg rules "$RULES_TEXT" \
+            --arg hints "$HINTS_TEXT" \
+            --arg context "$CONTEXT_TEXT" \
+            --arg diff "$DIFF_TEXT" \
             --arg sys "你是本公司的後端程式碼 reviewer。請嚴格依照公司規範審查這次變更，並用繁體中文回覆。重要：僅以 JSON 回覆，且必須符合以下 schema：{\n  \"violations\": [\n    {\n      \"rule\": string,            // 觸犯的規則或分類\n      \"severity\": \"minor|major|critical\",\n      \"file\": string,            // 嘗試從 diff 推斷，未知填 \"unknown\"\n      \"line\": number|null,       // 嘗試從 diff 推斷，未知可為 null\n      \"snippet\": string,         // 涉及的片段（可節錄）\n      \"explanation\": string,     // 問題說明與風險\n      \"fix\": string              // 具體修正建議\n    }\n  ]\n}. 嚴禁輸出 Markdown 或多餘文字，僅輸出符合 schema 的 JSON。" \
             '{
               model: $model,
