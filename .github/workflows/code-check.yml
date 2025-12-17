@@ -63,6 +63,21 @@ on:
         required: false
         type: string
         default: "50000"
+      ai_context_mode:
+        description: "是否附上『變更檔案在 HEAD 的完整內容』供 AI 參考 (full_changed_files|diff_only)"
+        required: false
+        type: string
+        default: "full_changed_files"
+      ai_context_max_files:
+        description: "納入上下文的最大檔案數（full_changed_files 模式）"
+        required: false
+        type: string
+        default: "30"
+      ai_context_max_chars_per_file:
+        description: "每個檔案納入的最大字元數（full_changed_files 模式）"
+        required: false
+        type: string
+        default: "15000"
       ai_validate_key:
         description: "在執行 AI 稽核前先做健康檢查（確認 OPENAI_API_KEY 與連線可用）"
         required: false
@@ -310,6 +325,94 @@ jobs:
             echo "[ai-review] diff.txt not found; skip summary"
           fi
 
+      # 3.1 由 diff 解析變更檔，收集完整檔案內容作為上下文（可選）
+      - name: Build changed files context (full contents)
+        id: context
+        if: ${{ inputs.ai_context_mode == 'full_changed_files' }}
+        run: |
+          set -e
+          : > changed-files.txt
+          : > context.txt
+          if [ ! -s diff.txt ]; then
+            echo "[ai-review] No diff; skip context build." >&2
+            echo "json_context=\"\"" >> $GITHUB_OUTPUT
+            echo "context_files=0" >> $GITHUB_OUTPUT
+            echo "context_bytes=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # 從 unified diff 取得變更後的檔名（+++ b/path）
+          awk '/^\+\+\+ b\//{print substr($0,7)}' diff.txt | sed 's#\r##' | sort -u > changed-files.txt
+          # 若清單為空（例如純刪除），從 diff --git 行取 b/ 檔名
+          if [ ! -s changed-files.txt ]; then
+            awk '/^diff --git a\//{print $4}' diff.txt | sed 's#^b/##' | sed 's#\r##' | sort -u > changed-files.txt || true
+          fi
+          MAX_FILES=${{ inputs.ai_context_max_files }}
+          MAX_CHARS_PER_FILE=${{ inputs.ai_context_max_chars_per_file }}
+          COUNT=0
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+            if [ $COUNT -ge $MAX_FILES ]; then
+              echo "[ai-review] Reached ai_context_max_files=$MAX_FILES; stop adding more files." >&2
+              break
+            fi
+            # 只處理 HEAD 仍存在的檔案（忽略刪除檔）
+            if git ls-tree -r --name-only HEAD | grep -Fx "$FILE" >/dev/null 2>&1; then
+              echo "===== FILE: $FILE (HEAD) =====" >> context.txt
+              CONTENT="$(git show HEAD:"$FILE" || true)"
+              if [ -n "$CONTENT" ]; then
+                LEN=${#CONTENT}
+                if [ "$LEN" -gt "$MAX_CHARS_PER_FILE" ]; then
+                  printf '%s' "$CONTENT" | head -c "$MAX_CHARS_PER_FILE" >> context.txt
+                  printf '\n[TRUNCATED file to %s chars from %s]\n' "$MAX_CHARS_PER_FILE" "$LEN" >> context.txt
+                else
+                  printf '%s\n' "$CONTENT" >> context.txt
+                fi
+                echo >> context.txt
+                COUNT=$((COUNT+1))
+              fi
+            fi
+          done < changed-files.txt
+          TOTAL_BYTES=0
+          if [ -f context.txt ]; then
+            TOTAL_BYTES=$(wc -c < context.txt | tr -d ' ')
+          fi
+          CONT_JSON=$(jq -Rs . < context.txt 2>/dev/null || echo '""')
+          echo "json_context=$CONT_JSON" >> $GITHUB_OUTPUT
+          echo "context_files=$COUNT" >> $GITHUB_OUTPUT
+          echo "context_bytes=$TOTAL_BYTES" >> $GITHUB_OUTPUT
+
+      - name: Finalize context output
+        id: ctx_out
+        if: always()
+        run: |
+          JSON=${{ steps.context.outputs.json_context }}
+          if [ -z "$JSON" ]; then
+            JSON="\"\""
+          fi
+          echo "json=$JSON" >> $GITHUB_OUTPUT
+
+      - name: Summarize context
+        if: ${{ always() && inputs.ai_context_mode == 'full_changed_files' }}
+        run: |
+          FILES=${{ steps.context.outputs.context_files }}
+          BYTES=${{ steps.context.outputs.context_bytes }}
+          if [ -n "$FILES" ]; then
+            {
+              echo "### AI Review · Context (full changed files)"
+              echo "- Files included: ${FILES}"
+              echo "- Total size: ${BYTES} bytes"
+              if [ -f context.txt ]; then
+                echo "<details><summary>Preview (first 200 chars)</summary>"
+                echo
+                echo '```text'
+                head -c 200 context.txt || true
+                echo
+                echo '```'
+                echo "</details>"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Decide whether we need to checkout the external templates repo for ai-rules
       - name: Decide rules source
         id: decide
@@ -516,16 +619,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ai-review-inputs
+          if-no-files-found: ignore
           path: |
             diff.txt
             merged-rules.txt
             hints.txt
+            changed-files.txt
+            context.txt
 
       # 4. 呼叫 OpenAI（或你之後自己的 AI）
       - name: Call OpenAI for AI review
         if: ${{ steps.diff.outputs.diff_empty != 'true' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JSON_CONTEXT: ${{ steps.ctx_out.outputs.json }}
         run: |
           if [ -z "$OPENAI_API_KEY" ]; then
             echo "OPENAI_API_KEY is not provided. Please add it as a secret in the caller repository or remove 'ai' from 'agents'." >&2
@@ -564,6 +671,14 @@ jobs:
               {
                 "role": "user",
                 "content": ${{ steps.hints.outputs.json_hints }}
+              },
+              {
+                "role": "user",
+                "content": "以下是本次變更檔案於 HEAD 的完整內容（可能被截斷）。請將其與 diff 交叉比對以更準確地定位問題（檔名、行號）。若外觀上無明顯變更，仍須檢查是否違反公司規範："
+              },
+              {
+                "role": "user",
+                "content": ${JSON_CONTEXT}
               },
               {
                 "role": "user",
