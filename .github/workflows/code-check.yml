@@ -88,6 +88,11 @@ on:
         required: false
         type: string
         default: "false"
+      ai_annotations:
+        description: "是否在工作流輸出 GitHub 註解（error/warning/notice）以標示違規位置"
+        required: false
+        type: string
+        default: "true"
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -763,6 +768,44 @@ jobs:
                 echo '```'
                 echo "</details>"
               } >> "$GITHUB_STEP_SUMMARY"
+
+              # Emit GitHub workflow annotations (optional)
+              if [ "${{ inputs.ai_annotations }}" = "true" ]; then
+                # Limit the number of annotations to avoid noisy logs
+                MAX_ANN=50
+                COUNT_ANN=0
+                jq -c '.violations[]' ai-result.json | while read -r item; do
+                  if [ $COUNT_ANN -ge $MAX_ANN ]; then break; fi
+                  rule=$(echo "$item" | jq -r '.rule // ""')
+                  sev=$(echo "$item" | jq -r '.severity // "major"')
+                  file=$(echo "$item" | jq -r '.file // ""')
+                  line=$(echo "$item" | jq -r '.line // empty')
+                  snippet=$(echo "$item" | jq -r '.snippet // ""' | head -c 300)
+                  explain=$(echo "$item" | jq -r '.explanation // ""' | head -c 400)
+                  fix=$(echo "$item" | jq -r '.fix // ""' | head -c 400)
+                  # Map severity to GitHub levels
+                  level="warning"
+                  if [ "$sev" = "critical" ]; then level="error"; fi
+                  if [ "$sev" = "minor" ]; then level="notice"; fi
+                  # Compose message; escape percent, CR, LF for workflow commands
+                  msg="[AI] ${rule} - ${explain}"
+                  [ -n "$fix" ] && msg="$msg | Fix: $fix"
+                  msg=${msg//'%'/'%25'}
+                  msg=${msg//$'\r'/'%0D'}
+                  msg=${msg//$'\n'/'%0A'}
+                  if [ -n "$file" ] && [ -n "$line" ]; then
+                    echo "::${level} file=${file},line=${line},col=1::${msg}"
+                  elif [ -n "$file" ]; then
+                    echo "::${level} file=${file}::${msg}"
+                  else
+                    echo "::${level}::${msg}"
+                  fi
+                  COUNT_ANN=$((COUNT_ANN+1))
+                done
+                if [ $COUNT_ANN -ge $MAX_ANN ]; then
+                  echo "[ai-review] Annotation limit reached ($MAX_ANN); remaining findings are in ai-result.json" >&2
+                fi
+              fi
 
               FAIL_ON=${{ inputs.ai_fail_on_violation }}
               MIN_SEV=${{ inputs.ai_fail_min_severity }}
