@@ -633,67 +633,82 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           JSON_CONTEXT: ${{ steps.ctx_out.outputs.json }}
+          RULES_JSON: ${{ steps.rules.outputs.json_rules }}
+          HINTS_JSON: ${{ steps.hints.outputs.json_hints }}
         run: |
           if [ -z "$OPENAI_API_KEY" ]; then
             echo "OPENAI_API_KEY is not provided. Please add it as a secret in the caller repository or remove 'ai' from 'agents'." >&2
             exit 1
           fi
 
-          # Truncate diff if larger than configured limit to keep request within token budget
+          # Prepare DIFF (as JSON string) with truncation if needed
           MAX_CHARS=${{ inputs.ai_max_diff_chars }}
-          DIFF_PAYLOAD=$(cat diff.txt)
-          DIFF_LEN=${#DIFF_PAYLOAD}
+          DIFF_RAW=$(cat diff.txt)
+          DIFF_LEN=${#DIFF_RAW}
           if [ "$DIFF_LEN" -gt "$MAX_CHARS" ]; then
-            TRUNCATED=$(head -c "$MAX_CHARS" diff.txt)
+            TRUNCATED=$(printf '%s' "$DIFF_RAW" | head -c "$MAX_CHARS")
             NOTICE="\n\n[TRUNCATED to ${MAX_CHARS} chars from ${DIFF_LEN}]"
-            JSON_DIFF_PAYLOAD=$(printf '%s' "$TRUNCATED$NOTICE" | jq -Rs .)
+            DIFF_JSON=$(printf '%s' "$TRUNCATED$NOTICE" | jq -Rs .)
+            DIFF_TRUNCATED="true"
           else
-            JSON_DIFF_PAYLOAD=${{ steps.diff.outputs.json_diff }}
+            DIFF_JSON=${{ steps.diff.outputs.json_diff }}
+            DIFF_TRUNCATED="false"
           fi
 
-          BODY=$(cat <<'EOF'
+          # Ensure CONTEXT_JSON is a valid JSON string value (already JSON-escaped in env)
+          CONTEXT_JSON="$JSON_CONTEXT"
+          if [ -z "$CONTEXT_JSON" ]; then
+            CONTEXT_JSON="\"\""
+          fi
+
+          # Summaries for visibility
           {
-            "model": "gpt-5-mini",
-            "temperature": 0,
-            "messages": [
-              {
-                "role": "system",
-                "content": "你是本公司的後端程式碼 reviewer。請嚴格依照公司規範審查這次變更，並用繁體中文回覆。重要：僅以 JSON 回覆，且必須符合以下 schema：{\n  \"violations\": [\n    {\n      \"rule\": string,            // 觸犯的規則或分類\n      \"severity\": \"minor|major|critical\",\n      \"file\": string,            // 嘗試從 diff 推斷，未知填 \"unknown\"\n      \"line\": number|null,       // 嘗試從 diff 推斷，未知可為 null\n      \"snippet\": string,         // 涉及的片段（可節錄）\n      \"explanation\": string,     // 問題說明與風險\n      \"fix\": string              // 具體修正建議\n    }\n  ]\n}. 嚴禁輸出 Markdown 或多餘文字，僅輸出符合 schema 的 JSON。"
-              },
-              {
-                "role": "system",
-                "content": ${{ steps.rules.outputs.json_rules }}
-              },
-              {
-                "role": "user",
-                "content": "以下為針對 diff 產生的提示（僅供聚焦可能的問題點）："
-              },
-              {
-                "role": "user",
-                "content": ${{ steps.hints.outputs.json_hints }}
-              },
-              {
-                "role": "user",
-                "content": "以下是本次變更檔案於 HEAD 的完整內容（可能被截斷）。請將其與 diff 交叉比對以更準確地定位問題（檔名、行號）。若外觀上無明顯變更，仍須檢查是否違反公司規範："
-              },
-              {
-                "role": "user",
-                "content": ${JSON_CONTEXT}
-              },
-              {
-                "role": "user",
-                "content": "以下是這次變更的 Git diff，請依照上述公司規範指出問題、風險與建議："
-              },
-              {
-                "role": "user",
-                "content": ${JSON_DIFF_PAYLOAD}
-              }
-            ],
-            "max_tokens": 1000
-          }
-          EOF
-          )
-          
+            echo "### AI Review · Payload inputs"
+            echo "- Diff bytes: ${DIFF_LEN} (truncated: ${DIFF_TRUNCATED})"
+            if [ -f context.txt ]; then
+              CTX_BYTES=$(wc -c < context.txt | tr -d ' ')
+            else
+              CTX_BYTES=0
+            fi
+            echo "- Context bytes: ${CTX_BYTES}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # If both diff and context are effectively empty, skip call
+          DIFF_EMPTY="false"
+          if [ "$DIFF_LEN" -eq 0 ]; then DIFF_EMPTY="true"; fi
+          CTX_EMPTY="false"
+          if [ "$CTX_BYTES" -eq 0 ]; then CTX_EMPTY="true"; fi
+          if [ "$DIFF_EMPTY" = "true" ] && [ "$CTX_EMPTY" = "true" ]; then
+            {
+              echo "- Skipping AI call because both diff and context are empty."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Build request body with jq to avoid shell interpolation issues
+          BODY=$(jq -n \
+            --arg model "gpt-5-mini" \
+            --argjson rules "$RULES_JSON" \
+            --argjson hints "$HINTS_JSON" \
+            --argjson context "$CONTEXT_JSON" \
+            --argjson diff "$DIFF_JSON" \
+            --arg sys "你是本公司的後端程式碼 reviewer。請嚴格依照公司規範審查這次變更，並用繁體中文回覆。重要：僅以 JSON 回覆，且必須符合以下 schema：{\n  \"violations\": [\n    {\n      \"rule\": string,            // 觸犯的規則或分類\n      \"severity\": \"minor|major|critical\",\n      \"file\": string,            // 嘗試從 diff 推斷，未知填 \"unknown\"\n      \"line\": number|null,       // 嘗試從 diff 推斷，未知可為 null\n      \"snippet\": string,         // 涉及的片段（可節錄）\n      \"explanation\": string,     // 問題說明與風險\n      \"fix\": string              // 具體修正建議\n    }\n  ]\n}. 嚴禁輸出 Markdown 或多餘文字，僅輸出符合 schema 的 JSON。" \
+            '{
+              model: $model,
+              temperature: 0,
+              messages: [
+                {role:"system", content:$sys},
+                {role:"system", content:$rules},
+                {role:"user", content:"以下為針對 diff 產生的提示（僅供聚焦可能的問題點）："},
+                {role:"user", content:$hints},
+                {role:"user", content:"以下是本次變更檔案於 HEAD 的完整內容（可能被截斷）。請將其與 diff 交叉比對以更準確地定位問題（檔名、行號）。若外觀上無明顯變更，仍須檢查是否違反公司規範："},
+                {role:"user", content:$context},
+                {role:"user", content:"以下是這次變更的 Git diff，請依照上述公司規範指出問題、風險與建議："},
+                {role:"user", content:$diff}
+              ],
+              max_tokens: 1000
+            }')
+
           # Capture HTTP status and body separately for better diagnostics
           HTTP_CODE=$(mktemp)
           RESP_BODY=$(mktemp)
@@ -722,10 +737,8 @@ jobs:
               echo
               echo "> 如果你看到空結果：請確認 OPENAI_API_KEY 是否有效、模型名稱是否可用、或稍後重試。"
             } >> "$GITHUB_STEP_SUMMARY"
-            # 仍不中止流程，避免阻斷其他檢查
             exit 0
           else
-            # 嘗試解析 JSON 結果
             if echo "$CONTENT" | jq -e . >/dev/null 2>&1; then
               echo "$CONTENT" > ai-result.json
               VIOLATION_COUNT=$(jq '.violations | length' ai-result.json 2>/dev/null || echo 0)
@@ -745,7 +758,6 @@ jobs:
                 echo "</details>"
               } >> "$GITHUB_STEP_SUMMARY"
 
-              # Optional fail policy
               FAIL_ON=${{ inputs.ai_fail_on_violation }}
               MIN_SEV=${{ inputs.ai_fail_min_severity }}
               if [ "$FAIL_ON" = "true" ]; then
