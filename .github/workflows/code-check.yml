@@ -925,6 +925,90 @@ jobs:
             echo '{"violations":[]}' > ai-result.json
           fi
 
+      - name: Generate heuristic findings and merge with AI result
+        run: |
+          set -e
+          # Build heuristic violations from context.txt if available
+          TMP_HEUR=$(mktemp)
+          echo '{"violations":[]}' > "$TMP_HEUR"
+
+          if [ -f context.txt ]; then
+            FILE=""
+            LINE_NO=0
+            # We'll parse context.txt which is in the format:
+            # ===== FILE: path (HEAD) =====
+            # followed by file contents
+            awk 'BEGIN{file="";}
+                 /^===== FILE: / {
+                   # extract file path between marker and (HEAD)
+                   match($0, /^===== FILE: (.*) \(HEAD\) =====/, m);
+                   if (m[1] != "") {file=m[1];}
+                   next;
+                 }
+                 {print file "\t" NR "\t" $0}' context.txt > __ctx_index.tsv
+
+            gen_entry() {
+              local rule="$1"; shift
+              local severity="$1"; shift
+              local file="$1"; shift
+              local line="$1"; shift
+              local snippet="$1"; shift
+              jq --arg rule "$rule" \
+                 --arg sev "$severity" \
+                 --arg file "$file" \
+                 --argjson line ${line:-null} \
+                 --arg snip "$snippet" \
+                 '.violations += [{rule:$rule, severity:$sev, file:$file, line:$line, snippet:$snip, explanation:"Heuristic match", fix:"依規範修正"}]' \
+                 "$TMP_HEUR" > "$TMP_HEUR.tmp" && mv "$TMP_HEUR.tmp" "$TMP_HEUR"
+            }
+
+            # Search for patterns
+            while IFS=$'\t' read -r f l t; do
+              # skip if file is empty (header not seen yet)
+              if [ -z "$f" ]; then continue; fi
+              # $request->all(
+              if echo "$t" | grep -qE "\$request->all\s*\("; then
+                gen_entry "Avoid \$request->all(); use validated()" "major" "$f" "$l" "$t"
+              fi
+              # Illuminate\\Http\\Request typehint or use
+              if echo "$t" | grep -qE "Illuminate\\\\Http\\\\Request"; then
+                gen_entry "Controller should use FormRequest instead of Illuminate\\Http\\Request" "major" "$f" "$l" "$t"
+              fi
+              # abort(
+              if echo "$t" | grep -qE "\babort\s*\("; then
+                gen_entry "Avoid direct abort(); use domain exceptions with handler" "minor" "$f" "$l" "$t"
+              fi
+              # DB::raw(
+              if echo "$t" | grep -qE "DB::raw\s*\("; then
+                gen_entry "Avoid DB::raw unless sanitized; prefer query builder/params" "major" "$f" "$l" "$t"
+              fi
+            done < __ctx_index.tsv
+          fi
+
+          # Merge heuristic results into ai-result.json (de-duplicate by file+line+rule basic)
+          if [ -s "$TMP_HEUR" ]; then
+            jq -s 'def key(v): ((v.file // "") + ":" + ((v.line|tostring) // "") + ":" + (v.rule // ""));
+                   {violations: ( (.[0].violations // []) + (.[1].violations // []) )
+                     | reduce .[] as $v ( [] ; 
+                         (.[key($v)]? // null) as $k |
+                         if $k==null then . + [$v] | .[key($v)]=1 else . end ) ) } 
+                   | {violations: map(delpaths([["__key"]])) }' \
+              ai-result.json "$TMP_HEUR" > ai-result.merged.json || echo '{"violations":[]}' > ai-result.merged.json
+            mv ai-result.merged.json ai-result.json
+          fi
+
+          # Append heuristic summary to Step Summary
+          if [ -f ai-result.json ]; then
+            V_TOTAL=$(jq '.violations|length' ai-result.json 2>/dev/null || echo 0)
+            V_CRIT=$(jq '[.violations[]|select(.severity=="critical")]|length' ai-result.json 2>/dev/null || echo 0)
+            V_MAJ=$(jq '[.violations[]|select(.severity=="major")]|length' ai-result.json 2>/dev/null || echo 0)
+            V_MIN=$(jq '[.violations[]|select(.severity=="minor")]|length' ai-result.json 2>/dev/null || echo 0)
+            {
+              echo "### AI Review · Heuristic Merge"
+              echo "- Total after merge: ${V_TOTAL} (critical=${V_CRIT}, major=${V_MAJ}, minor=${V_MIN})"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # 4.2 上傳結果為 artifact，方便離線存取
       - name: Upload AI result (artifact)
         uses: actions/upload-artifact@v4
