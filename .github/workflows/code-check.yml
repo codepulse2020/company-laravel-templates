@@ -98,7 +98,7 @@ on:
         description: "每個檔案納入的最大字元數（full_changed_files 模式）"
         required: false
         type: string
-        default: "15000"
+        default: "30000"
       ai_validate_key:
         description: "在執行 AI 稽核前先做健康檢查（確認 OPENAI_API_KEY 與連線可用）"
         required: false
@@ -1009,6 +1009,53 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Render Markdown report (ai-report.md)
+        run: |
+          set -e
+          TOTAL=$(jq '.violations|length' ai-result.json 2>/dev/null || echo 0)
+          CRIT=$(jq '[.violations[]|select(.severity=="critical")]|length' ai-result.json 2>/dev/null || echo 0)
+          MAJ=$(jq '[.violations[]|select(.severity=="major")]|length' ai-result.json 2>/dev/null || echo 0)
+          MIN=$(jq '[.violations[]|select(.severity=="minor")]|length' ai-result.json 2>/dev/null || echo 0)
+          {
+            echo '# AI 稽核結果'
+            echo
+            echo "- Total: ${TOTAL}"
+            echo "- critical: ${CRIT}, major: ${MAJ}, minor: ${MIN}"
+            echo
+          } > ai-report.md
+          if [ "$TOTAL" -eq 0 ]; then
+            {
+              echo '> 沒有發現違規項目。可能原因：'
+              echo '- 這次 diff 幾乎為空或僅包含非程式檔案'
+              echo '- 規則沒有命中（可調整規則或提高上下文上限）'
+              echo '- 模型回應為空或受限（請見工作流 Summary 的 Raw response 訊息）'
+            } >> ai-report.md
+          else
+            # 列出前 50 筆違規
+            jq -r '
+              def sev: ( ( .severity // "" ) | ascii_downcase ) as $s
+                | ( $s == "critical" and "CRITICAL" or ($s == "major" and "MAJOR" or ($s == "minor" and "MINOR" or ( .severity // "" ))) );
+              def line(v): if v==null then "" else ":" + (v|tostring) end;
+              def snip(v): if (v|tostring) == "" then "" else "\n```\n" + (v|tostring)[0:800] + "\n```\n" end;
+              .violations[:50]
+              | to_entries[]
+              | "\n## " + ((.key+1)|tostring) + ". " + ( {severity:.value}|.value|sev ) + " - " + (.value.rule // "") + "\n"
+                + ( if (.value.file // "") != "" then "- file: `" + (.value.file) + "`" + line(.value.line) + "\n" else "" end )
+                + snip(.value.snippet)
+                + ( if (.value.explanation // "") != "" then "- explanation: " + (.value.explanation|tostring) + "\n" else "" end )
+                + ( if (.value.fix // "") != "" then "- fix: " + (.value.fix|tostring) + "\n" else "" end )
+            ' ai-result.json >> ai-report.md
+          fi
+
+      - name: Prepare email body from ai-report.md
+        id: email_md
+        run: |
+          {
+            echo 'body<<EOF'
+            cat ai-report.md
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
       # 4.2 上傳結果為 artifact，方便離線存取
       - name: Upload AI result (artifact)
         uses: actions/upload-artifact@v4
@@ -1074,10 +1121,11 @@ jobs:
           to: ${{ steps.email_to.outputs.to != '' && steps.email_to.outputs.to || inputs.email_to }}
           from: ${{ inputs.email_from_override != '' && inputs.email_from_override || (inputs.smtp_from != '' && inputs.smtp_from || secrets.SMTP_FROM) }}
           subject: "${{ format('{0}: {1}@{2}', inputs.email_subject_prefix, github.repository, github.sha) }}"
-          content_type: text/plain
-          body: ${{ steps.email_prep.outputs.body }}
+          content_type: text/markdown
+          body: ${{ steps.email_md.outputs.body }}
           attachments: |
             ai-result.json
+            ai-report.md
 
       # 4.6 Optional fail policy as a dedicated step
       - name: Fail on violations (optional gate)
