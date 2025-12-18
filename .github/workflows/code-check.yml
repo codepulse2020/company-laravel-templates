@@ -903,105 +903,6 @@ jobs:
                   echo "[ai-review] Annotation limit reached ($MAX_ANN); remaining findings are in ai-result.json" >&2
                 fi
               fi
-
-            # 4.1 確保結果檔存在（若模型未回傳內容也建立空結構），便於後續輸出
-            - name: Ensure ai-result.json exists
-              if: always()
-              run: |
-                if [ ! -f ai-result.json ]; then
-                  echo '{"violations":[]}' > ai-result.json
-                fi
-
-            # 4.2 上傳結果為 artifact，方便離線存取
-            - name: Upload AI result (artifact)
-              if: always()
-              uses: actions/upload-artifact@v4
-              with:
-                name: ai-review-result
-                if-no-files-found: ignore
-                path: |
-                  ai-result.json
-
-            # 4.3 以 API 方式將結果送至內部系統
-            - name: Push AI result to internal API
-              if: ${{ always() && inputs.api_push_result == 'true' }}
-              env:
-                HOOK_URL: ${{ secrets.AI_RESULT_WEBHOOK_URL }}
-                HOOK_TOKEN: ${{ secrets.AI_RESULT_WEBHOOK_TOKEN }}
-              run: |
-                if [ -z "$HOOK_URL" ]; then
-                  echo "[ai-review] AI_RESULT_WEBHOOK_URL is not set; skip API push." >&2
-                  exit 0
-                fi
-                # 帶 Bearer token（若有）
-                if [ -n "$HOOK_TOKEN" ]; then
-                  AUTH_HEADER="Authorization: Bearer $HOOK_TOKEN"
-                else
-                  AUTH_HEADER=""
-                fi
-                echo "[ai-review] POST ai-result.json to $HOOK_URL" >&2
-                curl -sS -X POST "$HOOK_URL" \
-                  -H "$AUTH_HEADER" \
-                  -H "Content-Type: application/json" \
-                  --data-binary @ai-result.json \
-                  -o /tmp/hook_resp.txt -w "HTTP:%{http_code}\n" || true
-                echo "[ai-review] Hook response (first 200 chars):" >&2
-                head -c 200 /tmp/hook_resp.txt || true
-
-            # 4.4 準備 Email 內容（摘要），供寄送步驟使用
-            - name: Prepare email summary
-              id: email_prep
-              if: ${{ always() && inputs.email_send_result == 'true' }}
-              run: |
-                VIOLATIONS=$(jq '.violations | length' ai-result.json 2>/dev/null || echo 0)
-                CRIT=$(jq '[.violations[]|select(.severity=="critical")] | length' ai-result.json 2>/dev/null || echo 0)
-                MAJ=$(jq '[.violations[]|select(.severity=="major")] | length' ai-result.json 2>/dev/null || echo 0)
-                MIN=$(jq '[.violations[]|select(.severity=="minor")] | length' ai-result.json 2>/dev/null || echo 0)
-                BODY="Repo: ${GITHUB_REPOSITORY}\nCommit: ${GITHUB_SHA}\nTotal violations: ${VIOLATIONS} (critical=${CRIT}, major=${MAJ}, minor=${MIN})\n\n前 5 筆：\n$(jq -r '[.violations[:5][] | "- [\(.severity)] \(.rule) @ \(.file // "unknown"):\(.line // "")" ] | join("\n")' ai-result.json 2>/dev/null)"
-                # 將換行與百分比做跳脫以便輸出
-                BODY_ESC=${BODY//'%'/'%25'}
-                BODY_ESC=${BODY_ESC//$'\n'/'%0A'}
-                BODY_ESC=${BODY_ESC//$'\r'/'%0D'}
-                echo "body=$BODY_ESC" >> $GITHUB_OUTPUT
-
-            # 4.5 寄送 Email（SMTP 可由 inputs 或 Secrets 提供）
-            - name: Send email with AI result
-              if: ${{ always() && inputs.email_send_result == 'true' }}
-              uses: dawidd6/action-send-mail@v3
-              with:
-                # 伺服器與認證：inputs 優先，否則用 secrets（方便集中在此模板設定）
-                server_address: ${{ inputs.smtp_server != '' && inputs.smtp_server || secrets.SMTP_SERVER }}
-                server_port: ${{ inputs.smtp_port != '' && inputs.smtp_port || secrets.SMTP_PORT }}
-                username: ${{ inputs.smtp_user != '' && inputs.smtp_user || secrets.SMTP_USER }}
-                password: ${{ inputs.smtp_pass != '' && inputs.smtp_pass || secrets.SMTP_PASS }}
-                # 收件人：若有自動解析結果，優先使用；否則用 inputs.email_to（可為多位，以逗號分隔）
-                to: ${{ steps.email_to.outputs.to != '' && steps.email_to.outputs.to || inputs.email_to }}
-                from: ${{ inputs.email_from_override != '' && inputs.email_from_override || (inputs.smtp_from != '' && inputs.smtp_from || secrets.SMTP_FROM) }}
-                subject: ${{ inputs.email_subject_prefix }}: ${{ github.repository }}@${{ github.sha }}
-                content_type: text/plain
-                body: ${{ steps.email_prep.outputs.body }}
-                attachments: |
-                  ai-result.json
-
-              FAIL_ON=${{ inputs.ai_fail_on_violation }}
-              MIN_SEV=${{ inputs.ai_fail_min_severity }}
-              if [ "$FAIL_ON" = "true" ]; then
-                THRESHOLD=0
-                case "$MIN_SEV" in
-                  critical)
-                    THRESHOLD=$CRIT_COUNT ;;
-                  major)
-                    THRESHOLD=$((CRIT_COUNT + MAJOR_COUNT)) ;;
-                  minor)
-                    THRESHOLD=$((CRIT_COUNT + MAJOR_COUNT + MINOR_COUNT)) ;;
-                  *)
-                    THRESHOLD=$((CRIT_COUNT + MAJOR_COUNT)) ;;
-                esac
-                if [ "$THRESHOLD" -gt 0 ]; then
-                  echo "[ai-review] Failing due to violations (threshold=$MIN_SEV)." >&2
-                  exit 2
-                fi
-              fi
             else
               echo "[ai-review] Model did not return valid JSON despite instruction. Showing raw content." >&2
               {
@@ -1088,7 +989,7 @@ jobs:
           # 收件人：若有自動解析結果，優先使用；否則用 inputs.email_to（可為多位，以逗號分隔）
           to: ${{ steps.email_to.outputs.to != '' && steps.email_to.outputs.to || inputs.email_to }}
           from: ${{ inputs.email_from_override != '' && inputs.email_from_override || (inputs.smtp_from != '' && inputs.smtp_from || secrets.SMTP_FROM) }}
-          subject: ${{ format('{0}: {1}@{2}', inputs.email_subject_prefix, github.repository, github.sha) }}
+          subject: "${{ format('{0}: {1}@{2}', inputs.email_subject_prefix, github.repository, github.sha) }}"
           content_type: text/plain
           body: ${{ steps.email_prep.outputs.body }}
           attachments: |
