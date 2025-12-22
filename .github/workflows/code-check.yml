@@ -118,7 +118,7 @@ on:
         description: "AI 回應最大 tokens 上限（對應新參數 max_completion_tokens）"
         required: false
         type: string
-        default: "1000"
+        default: "2000"
       ai_validate_key:
         description: "在執行 AI 稽核前先做健康檢查（確認 OPENAI_API_KEY 與連線可用）"
         required: false
@@ -840,6 +840,36 @@ jobs:
             --arg maxct "${{ inputs.ai_max_completion_tokens }}" \
             '{
               model: $model,
+              response_format: {
+                type: "json_schema",
+                json_schema: {
+                  name: "ai_review_violations",
+                  schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["violations"],
+                    properties: {
+                      violations: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          additionalProperties: false,
+                          required: ["rule", "severity"],
+                          properties: {
+                            rule: { type: "string" },
+                            severity: { type: "string", enum: ["minor","major","critical"] },
+                            file: { type: "string" },
+                            line: { type: ["integer","null"] },
+                            snippet: { type: "string" },
+                            explanation: { type: "string" },
+                            fix: { type: "string" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
               messages: [
                 {role:"system", content:$sys},
                 {role:"system", content:$rules},
