@@ -39,6 +39,11 @@ on:
         required: false
         type: string
         default: "eslint,unit"
+      ai_debug:
+        description: "Enable debug: attach diff/context, AI request and raw response"
+        required: false
+        default: 'true'
+        type: string
       role:
         description: "職能類型 (backend/frontend/qa/pm...)"
         required: false
@@ -817,6 +822,11 @@ jobs:
               max_tokens: 1000
             }')
 
+          # Save request body if debug enabled
+          if [ "${{ inputs.ai_debug }}" = "true" ]; then
+            printf '%s' "$BODY" > ai-request.json
+          fi
+
           # Capture HTTP status and body separately for better diagnostics
           HTTP_CODE=$(mktemp)
           RESP_BODY=$(mktemp)
@@ -826,6 +836,11 @@ jobs:
             -d "$BODY" > "$HTTP_CODE"
           STATUS=$(cat "$HTTP_CODE")
           RESPONSE=$(cat "$RESP_BODY")
+
+          # Save raw response if debug enabled
+          if [ "${{ inputs.ai_debug }}" = "true" ]; then
+            printf '%s' "$RESPONSE" > ai-response.json
+          fi
 
           CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
           if [ -z "$CONTENT" ] || [ "$STATUS" -ge 400 ]; then
@@ -1065,6 +1080,38 @@ jobs:
           path: |
             ai-result.json
 
+      - name: Upload AI debug bundle (artifact)
+        if: ${{ inputs.ai_debug == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-debug
+          if-no-files-found: ignore
+          path: |
+            diff.txt
+            context.txt
+            merged-rules.txt
+            hints.txt
+            ai-request.json
+            ai-response.json
+
+      - name: Build email attachments list
+        id: attachments
+        run: |
+          {
+            echo 'list<<EOF'
+            echo 'ai-result.json'
+            echo 'ai-report.md'
+            if [ "${{ inputs.ai_debug }}" = "true" ]; then
+              [ -f diff.txt ] && echo 'diff.txt'
+              [ -f context.txt ] && echo 'context.txt'
+              [ -f merged-rules.txt ] && echo 'merged-rules.txt'
+              [ -f hints.txt ] && echo 'hints.txt'
+              [ -f ai-request.json ] && echo 'ai-request.json'
+              [ -f ai-response.json ] && echo 'ai-response.json'
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       # 4.3 以 API 方式將結果送至內部系統
       - name: Push AI result to internal API
         if: ${{ inputs.api_push_result == 'true' }}
@@ -1123,9 +1170,7 @@ jobs:
           subject: "${{ format('{0}: {1}@{2}', inputs.email_subject_prefix, github.repository, github.sha) }}"
           content_type: text/markdown
           body: ${{ steps.email_md.outputs.body }}
-          attachments: |
-            ai-result.json
-            ai-report.md
+          attachments: ${{ steps.attachments.outputs.list }}
 
       # 4.6 Optional fail policy as a dedicated step
       - name: Fail on violations (optional gate)
