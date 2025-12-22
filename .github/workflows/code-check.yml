@@ -104,6 +104,16 @@ on:
         required: false
         type: string
         default: "30000"
+      ai_model:
+        description: "AI 模型名稱（例如：gpt-5-mini）"
+        required: false
+        type: string
+        default: "gpt-5-mini"
+      ai_max_completion_tokens:
+        description: "AI 回應最大 tokens 上限（對應新參數 max_completion_tokens）"
+        required: false
+        type: string
+        default: "1000"
       ai_validate_key:
         description: "在執行 AI 稽核前先做健康檢查（確認 OPENAI_API_KEY 與連線可用）"
         required: false
@@ -270,10 +280,11 @@ jobs:
 
           # 送一個最小請求做健康檢查
           BODY=$(cat <<'EOF'
-          {"model":"gpt-5-mini","temperature":0,"max_completion_tokens":1,
+          {"model":"__MODEL__","max_completion_tokens":1,
            "messages":[{"role":"user","content":"ping"}]}
           EOF
           )
+          BODY=${BODY/__MODEL__/${{ inputs.ai_model }}}
 
           CODE_FILE=$(mktemp)
           RESP_FILE=$(mktemp)
@@ -800,15 +811,15 @@ jobs:
 
           # Build request body with jq using string args to avoid invalid JSON issues
           BODY=$(jq -n \
-            --arg model "gpt-5-mini" \
+            --arg model "${{ inputs.ai_model }}" \
             --arg rules "$RULES_TEXT" \
             --arg hints "$HINTS_TEXT" \
             --arg context "$CONTEXT_TEXT" \
             --arg diff "$DIFF_TEXT" \
             --arg sys "你是本公司的後端程式碼 reviewer。請嚴格依照公司規範審查這次變更，並用繁體中文回覆。重要：僅以 JSON 回覆，且必須符合以下 schema：{\n  \"violations\": [\n    {\n      \"rule\": string,            // 觸犯的規則或分類\n      \"severity\": \"minor|major|critical\",\n      \"file\": string,            // 嘗試從 diff 推斷，未知填 \"unknown\"\n      \"line\": number|null,       // 嘗試從 diff 推斷，未知可為 null\n      \"snippet\": string,         // 涉及的片段（可節錄）\n      \"explanation\": string,     // 問題說明與風險\n      \"fix\": string              // 具體修正建議\n    }\n  ]\n}. 嚴禁輸出 Markdown 或多餘文字，僅輸出符合 schema 的 JSON。" \
+            --arg maxct "${{ inputs.ai_max_completion_tokens }}" \
             '{
               model: $model,
-              temperature: 0,
               messages: [
                 {role:"system", content:$sys},
                 {role:"system", content:$rules},
@@ -819,7 +830,7 @@ jobs:
                 {role:"user", content:"以下是這次變更的 Git diff，請依照上述公司規範指出問題、風險與建議："},
                 {role:"user", content:$diff}
               ],
-              max_completion_tokens: 1000
+              max_completion_tokens: ($maxct|tonumber)
             }')
 
           # Save request body if debug enabled
