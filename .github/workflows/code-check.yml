@@ -270,7 +270,7 @@ jobs:
 
           # 送一個最小請求做健康檢查
           BODY=$(cat <<'EOF'
-          {"model":"gpt-5-mini","temperature":0,"max_tokens":1,
+          {"model":"gpt-5-mini","temperature":0,"max_completion_tokens":1,
            "messages":[{"role":"user","content":"ping"}]}
           EOF
           )
@@ -819,7 +819,7 @@ jobs:
                 {role:"user", content:"以下是這次變更的 Git diff，請依照上述公司規範指出問題、風險與建議："},
                 {role:"user", content:$diff}
               ],
-              max_tokens: 1000
+              max_completion_tokens: 1000
             }')
 
           # Save request body if debug enabled
