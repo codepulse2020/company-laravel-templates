@@ -104,6 +104,11 @@ on:
         required: false
         type: string
         default: "30000"
+      ai_extra_context:
+        description: "當自動收集的 context 為空時，可手動提供額外的上下文（原始程式碼片段或完整檔案內容）"
+        required: false
+        type: string
+        default: ""
       ai_model:
         description: "AI 模型名稱（例如：gpt-5-mini）"
         required: false
@@ -720,6 +725,7 @@ jobs:
             hints.txt
             changed-files.txt
             context.txt
+            extra-context.txt
 
       # 4.0 解析 Email 收件人（當 email_to 未提供且允許自動推斷時）
       - name: Resolve email recipients (auto)
@@ -753,6 +759,7 @@ jobs:
           JSON_CONTEXT: ${{ steps.ctx_out.outputs.json }}
           RULES_JSON: ${{ steps.rules.outputs.json_rules }}
           HINTS_JSON: ${{ steps.hints.outputs.json_hints }}
+          EXTRA_CONTEXT: ${{ inputs.ai_extra_context }}
         run: |
           if [ -z "$OPENAI_API_KEY" ]; then
             echo "OPENAI_API_KEY is not provided. Please add it as a secret in the caller repository or remove 'ai' from 'agents'." >&2
@@ -794,7 +801,9 @@ jobs:
             else
               CTX_BYTES=0
             fi
-            echo "- Context bytes: ${CTX_BYTES}"
+            EXTRA_BYTES=${#EXTRA_CONTEXT}
+            echo "- Context bytes (auto-collected): ${CTX_BYTES}"
+            echo "- Extra context bytes (manual): ${EXTRA_BYTES}"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # If both diff and context are effectively empty, skip call
@@ -802,11 +811,22 @@ jobs:
           if [ "$DIFF_LEN" -eq 0 ]; then DIFF_EMPTY="true"; fi
           CTX_EMPTY="false"
           if [ "$CTX_BYTES" -eq 0 ]; then CTX_EMPTY="true"; fi
-          if [ "$DIFF_EMPTY" = "true" ] && [ "$CTX_EMPTY" = "true" ]; then
+          USE_EXTRA="false"
+          if [ "$CTX_EMPTY" = "true" ] && [ -n "$EXTRA_CONTEXT" ]; then
+            # Use provided extra context as fallback and persist for artifacts
+            CONTEXT_TEXT="$EXTRA_CONTEXT"
+            printf '%s' "$EXTRA_CONTEXT" > extra-context.txt
+            USE_EXTRA="true"
+          fi
+          if [ "$DIFF_EMPTY" = "true" ] && [ "$CTX_EMPTY" = "true" ] && [ -z "$EXTRA_CONTEXT" ]; then
             {
-              echo "- Skipping AI call because both diff and context are empty."
+              echo "- Skipping AI call because diff, context, and extra context are all empty."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
+          fi
+
+          if [ "$USE_EXTRA" = "true" ]; then
+            echo "- Using extra context fallback (manual input)." >> "$GITHUB_STEP_SUMMARY"
           fi
 
           # Build request body with jq using string args to avoid invalid JSON issues
@@ -814,7 +834,7 @@ jobs:
             --arg model "${{ inputs.ai_model }}" \
             --arg rules "$RULES_TEXT" \
             --arg hints "$HINTS_TEXT" \
-            --arg context "$CONTEXT_TEXT" \
+            --arg context "${CONTEXT_TEXT:-$CONTEXT_TEXT}" \
             --arg diff "$DIFF_TEXT" \
             --arg sys "你是本公司的後端程式碼 reviewer。請嚴格依照公司規範審查這次變更，並用繁體中文回覆。重要：僅以 JSON 回覆，且必須符合以下 schema：{\n  \"violations\": [\n    {\n      \"rule\": string,            // 觸犯的規則或分類\n      \"severity\": \"minor|major|critical\",\n      \"file\": string,            // 嘗試從 diff 推斷，未知填 \"unknown\"\n      \"line\": number|null,       // 嘗試從 diff 推斷，未知可為 null\n      \"snippet\": string,         // 涉及的片段（可節錄）\n      \"explanation\": string,     // 問題說明與風險\n      \"fix\": string              // 具體修正建議\n    }\n  ]\n}. 嚴禁輸出 Markdown 或多餘文字，僅輸出符合 schema 的 JSON。" \
             --arg maxct "${{ inputs.ai_max_completion_tokens }}" \
@@ -1100,6 +1120,7 @@ jobs:
           path: |
             diff.txt
             context.txt
+            extra-context.txt
             merged-rules.txt
             hints.txt
             ai-request.json
@@ -1115,6 +1136,7 @@ jobs:
             if [ "${{ inputs.ai_debug }}" = "true" ]; then
               [ -f diff.txt ] && echo 'diff.txt'
               [ -f context.txt ] && echo 'context.txt'
+              [ -f extra-context.txt ] && echo 'extra-context.txt'
               [ -f merged-rules.txt ] && echo 'merged-rules.txt'
               [ -f hints.txt ] && echo 'hints.txt'
               [ -f ai-request.json ] && echo 'ai-request.json'
