@@ -360,6 +360,11 @@ jobs:
         id: diff
         run: |
           set -e
+          # 強化除錯與通配處理
+          set -o pipefail || true
+          shopt -s nullglob || true
+          # 如需詳細追蹤，可在 debug 模式下開啟 set -x
+          if [ "${{ inputs.ai_debug }}" = "true" ]; then set -x; fi
           EVENT_NAME="${{ github.event_name }}"
 
           DIFF=""
@@ -825,7 +830,9 @@ jobs:
               # 副檔名篩選（當 EXT_FILTER 非空時才啟用）
               if [ -n "$EXT_FILTER" ]; then
                 ext_lc=$(echo "${f##*.}" | tr 'A-Z' 'a-z')
-                echo "$FILTER_NORM" | grep -q ",$ext_lc," || { continue; }
+                if ! echo "$FILTER_NORM" | grep -q ",$ext_lc,"; then
+                  continue
+                fi
               fi
               FILES_SEL+="$f\n"
               COUNT=$((COUNT+1))
@@ -990,7 +997,7 @@ jobs:
           {
             echo '['
             first=1
-            for r in out/ai/*.resp.*.json 2>/dev/null; do
+            for r in out/ai/*.resp.*.json; do
               [ -e "$r" ] || continue
               base=$(basename "$r")
               safe_name=${base%%.resp.*}
@@ -1014,9 +1021,16 @@ jobs:
             echo "- Selected files: $FILE_COUNT"
             RESP_COUNT=$(ls -1 out/ai/*.resp.*.json 2>/dev/null | wc -l | tr -d ' ')
             echo "- Responses: $RESP_COUNT"
-            OK=$(grep -h -o '^[0-9][0-9][0-9]$' out/ai/*.status.* 2>/dev/null | awk '$1 ~ /^2/ {c++} END{print c+0}')
-            C4=$(grep -h -o '^[0-9][0-9][0-9]$' out/ai/*.status.* 2>/dev/null | awk '$1 ~ /^4/ {c++} END{print c+0}')
-            C5=$(grep -h -o '^[0-9][0-9][0-9]$' out/ai/*.status.* 2>/dev/null | awk '$1 ~ /^5/ {c++} END{print c+0}')
+            OK=0; C4=0; C5=0
+            for s in out/ai/*.status.*; do
+              [ -e "$s" ] || continue
+              code=$(tr -d '\r\n' < "$s")
+              case "$code" in
+                2??) OK=$((OK+1));;
+                4??) C4=$((C4+1));;
+                5??) C5=$((C5+1));;
+              esac
+            done
             echo "- HTTP status counts: 2xx=$OK, 4xx=$C4, 5xx=$C5"
           } >> "$GITHUB_STEP_SUMMARY"
 
