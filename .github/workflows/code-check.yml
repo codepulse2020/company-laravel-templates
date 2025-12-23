@@ -104,6 +104,37 @@ on:
         required: false
         type: string
         default: "30000"
+      # 逐檔審查（分批請求）設定
+      ai_per_file_mode:
+        description: "逐檔審查模式：off=單次請求（舊行為）| file=逐檔（預設）| hunk=依修改片段（預留）"
+        required: false
+        type: string
+        default: "file"
+      ai_per_file_max_files:
+        description: "逐檔審查納入的最大檔案數上限"
+        required: false
+        type: string
+        default: "30"
+      ai_per_file_max_chunks_per_file:
+        description: "單一檔案最多切成幾個區塊送審（避免單次 payload 過大）"
+        required: false
+        type: string
+        default: "3"
+      ai_per_file_max_chars_per_chunk:
+        description: "每個區塊的字元上限"
+        required: false
+        type: string
+        default: "12000"
+      ai_file_extensions:
+        description: "僅審查特定副檔名（逗號分隔，空白=不篩選）。例如：php,js,ts"
+        required: false
+        type: string
+        default: "php"
+      ai_request_timeout_sec:
+        description: "單次 AI 呼叫的逾時秒數（curl 層）"
+        required: false
+        type: string
+        default: "120"
       ai_extra_context:
         description: "當自動收集的 context 為空時，可手動提供額外的上下文（原始程式碼片段或完整檔案內容）"
         required: false
@@ -752,8 +783,213 @@ jobs:
           echo "to=$TO_LIST" >> $GITHUB_OUTPUT
 
       # 4. 呼叫 OpenAI（或你之後自己的 AI）
+      # 4.a 逐檔審查（分批請求）
+      - name: Per-file AI review (chunked)
+        if: ${{ inputs.ai_per_file_mode != 'off' && steps.diff.outputs.diff_empty != 'true' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RULES_JSON: ${{ steps.rules.outputs.json_rules }}
+          HINTS_JSON: ${{ steps.hints.outputs.json_hints }}
+        run: |
+          set -e
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY is not provided. Please add it as a secret in the caller repository or remove 'ai' from 'agents'." >&2
+            exit 1
+          fi
+
+          # 準備變數與目錄
+          MAX_FILES=${{ inputs.ai_per_file_max_files }}
+          MAX_CHUNKS=${{ inputs.ai_per_file_max_chunks_per_file }}
+          CHUNK_LIMIT=${{ inputs.ai_per_file_max_chars_per_chunk }}
+          TIMEOUT=${{ inputs.ai_request_timeout_sec }}
+          MODEL='${{ inputs.ai_model }}'
+          MAX_COMPLETION='${{ inputs.ai_max_completion_tokens }}'
+          EXT_FILTER='${{ inputs.ai_file_extensions }}'
+
+          mkdir -p out/ai
+          : > out/ai/_index.tsv
+
+          # 準備規則/提示文字（從 JSON 字串解碼回原文）
+          RULES_TEXT=$(printf '%s' "$RULES_JSON" | jq -r . 2>/dev/null || echo "")
+          HINTS_TEXT=$(printf '%s' "$HINTS_JSON" | jq -r . 2>/dev/null || echo "")
+
+          # 建立檔名清單（依副檔名篩選，限制數量）
+          FILES_ALL=$(cat changed-files.txt 2>/dev/null || true)
+          FILES_SEL=""
+          COUNT=0
+          if [ -n "$FILES_ALL" ]; then
+            IFS=$'\n'
+            for f in $FILES_ALL; do
+              # 副檔名篩選
+              if [ -n "$EXT_FILTER" ]; then
+                ext=${f##*.}
+                echo ",$EXT_FILTER," | tr 'A-Z' 'a-z' | grep -q ",$((echo "$ext" | tr 'A-Z' 'a-z'))," || { continue; }
+              fi
+              FILES_SEL+="$f\n"
+              COUNT=$((COUNT+1))
+              if [ $COUNT -ge $MAX_FILES ]; then break; fi
+            done
+            unset IFS
+          fi
+
+          if [ -z "$FILES_SEL" ]; then
+            echo "[ai-review] No files selected for per-file review (filter or empty). Skipping." >&2
+            # 建立空結果以供後續步驟
+            echo '{"violations":[]}' > ai-result.json
+            exit 0
+          fi
+
+          # 從整體 diff.txt 擷取指定檔案的 diff 片段
+          extract_file_diff() {
+            local path="$1"
+            awk -v p=" $path" '
+              /^diff --git / {print_line=0}
+              /^diff --git a\// {
+                # 檢查本段是否對應到目標檔案
+                if ($0 ~ (" diff --git a/" p " b/" p "$")) {print_line=1; print $0; next}
+              }
+              print_line==1 {print}
+            ' diff.txt 2>/dev/null || true
+          }
+
+          sanitize() {
+            echo "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
+          }
+
+          # 初始化結果
+          echo '{"violations":[]}' > ai-result.json
+
+          # 逐檔處理
+          echo "$FILES_SEL" | sed '/^$/d' | while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+            SAFE=$(sanitize "$FILE")
+            # 取得 HEAD 版本內容
+            if ! git show HEAD:"$FILE" > out/ai/$SAFE.full 2>/dev/null; then
+              # 檔案可能被刪除，跳過
+              continue
+            fi
+
+            # 取得該檔 diff 片段
+            extract_file_diff "$FILE" > out/ai/$SAFE.diff || true
+
+            # 切 chunk
+            CONTENT=$(cat out/ai/$SAFE.full)
+            LEN=${#CONTENT}
+            if [ "$LEN" -eq 0 ]; then
+              continue
+            fi
+            START=0
+            CHUNK_IDX=0
+            while [ $START -lt $LEN ] && [ $CHUNK_IDX -lt $MAX_CHUNKS ]; do
+              CHUNK=${CONTENT:$START:$CHUNK_LIMIT}
+              echo "$CHUNK" > out/ai/$SAFE.chunk.$CHUNK_IDX
+              START=$((START+CHUNK_LIMIT))
+              CHUNK_IDX=$((CHUNK_IDX+1))
+            done
+
+            TOTAL_CHUNKS=$CHUNK_IDX
+            IDX=0
+            while [ $IDX -lt $TOTAL_CHUNKS ]; do
+              CHUNK_TXT=$(cat out/ai/$SAFE.chunk.$IDX)
+              # 準備 JSON 參數
+              CHUNK_JSON=$(printf '%s' "$CHUNK_TXT" | jq -Rs .)
+              DIFF_TXT=$(cat out/ai/$SAFE.diff 2>/dev/null || echo "")
+              DIFF_JSON=$(printf '%s' "$DIFF_TXT" | jq -Rs .)
+
+              # 建立請求 JSON（強制 JSON schema 輸出）
+              BODY=$(jq -n \
+                --arg model "$MODEL" \
+                --arg rules "$RULES_TEXT" \
+                --arg hints "$HINTS_TEXT" \
+                --arg file "$FILE" \
+                --arg chunk_txt "$CHUNK_TXT" \
+                --arg diff_txt "$DIFF_TXT" \
+                --arg sys "你是本公司的後端程式碼 reviewer。請嚴格依照公司規範審查這次變更，並用繁體中文回覆。重要：僅以 JSON 回覆，且必須符合以下 schema：{\n  \"violations\": [\n    {\n      \"rule\": string,\n      \"severity\": \"minor|major|critical\",\n      \"file\": string,\n      \"line\": number|null,\n      \"snippet\": string,\n      \"explanation\": string,\n      \"fix\": string\n    }\n  ]\n}. 嚴禁輸出 Markdown 或多餘文字，僅輸出符合 schema 的 JSON。" \
+                --arg maxct "$MAX_COMPLETION" \
+                --arg chunk_info "本次審查目標檔案: $FILE；區塊 $(($IDX+1)) / $TOTAL_CHUNKS。請僅回報與此檔案相關之違規，並盡可能標示行號。" \
+                '{
+                  model: $model,
+                  response_format: {
+                    type: "json_schema",
+                    json_schema: {
+                      name: "ai_review_violations",
+                      schema: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["violations"],
+                        properties: {
+                          violations: {
+                            type: "array",
+                            items: {
+                              type: "object",
+                              additionalProperties: false,
+                              required: ["rule", "severity"],
+                              properties: {
+                                rule: { type: "string" },
+                                severity: { type: "string", enum: ["minor","major","critical"] },
+                                file: { type: "string" },
+                                line: { type: ["integer","null"] },
+                                snippet: { type: "string" },
+                                explanation: { type: "string" },
+                                fix: { type: "string" }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  messages: [
+                    {role:"system", content:$sys},
+                    {role:"system", content:$rules},
+                    {role:"user", content:"以下為針對 diff 產生的提示（僅供聚焦可能的問題點）："},
+                    {role:"user", content:$hints},
+                    {role:"user", content:$chunk_info},
+                    {role:"user", content:"以下是該檔案的內容片段（可能截斷）："},
+                    {role:"user", content:$chunk_txt},
+                    {role:"user", content:"以下是該檔案的 Git diff 片段（若有）："},
+                    {role:"user", content:$diff_txt}
+                  ],
+                  max_completion_tokens: ($maxct|tonumber)
+                }')
+
+              # 送出請求
+              REQ=out/ai/$SAFE.req.$IDX.json
+              RESP=out/ai/$SAFE.resp.$IDX.json
+              printf '%s' "$BODY" > "$REQ"
+              HTTP_CODE=$(mktemp)
+              curl -s --max-time "$TIMEOUT" -w "%{http_code}" -o "$RESP" https://api.openai.com/v1/chat/completions \
+                -H "Authorization: Bearer $OPENAI_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d @"$REQ" > "$HTTP_CODE" || true
+              STATUS=$(cat "$HTTP_CODE")
+              rm -f "$HTTP_CODE"
+
+              # 解析回應
+              CONTENT=$(cat "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null || echo "")
+              if [ -n "$CONTENT" ] && echo "$CONTENT" | jq -e . >/dev/null 2>&1; then
+                # 合併至總結果
+                TMP=$(mktemp)
+                printf '%s' "$CONTENT" > "$TMP"
+                jq -s '{violations: ( (.[0].violations // []) + (.[1].violations // []) )}' ai-result.json "$TMP" > ai-result.merged.json 2>/dev/null || echo '{"violations":[]}' > ai-result.merged.json
+                mv ai-result.merged.json ai-result.json
+                rm -f "$TMP"
+              else
+                echo "[ai-review] Empty or invalid JSON for $FILE chunk $IDX (HTTP $STATUS)" >&2
+              fi
+
+              IDX=$((IDX+1))
+            done
+          done
+
+          # Debug 附件：保留請求與回應
+          if [ "${{ inputs.ai_debug }}" = "true" ]; then
+            # 打包索引（列出檔案與區塊）
+            ls -1 out/ai | sort > out/ai/_files.list || true
+          fi
+
       - name: Call OpenAI for AI review
-        if: ${{ steps.diff.outputs.diff_empty != 'true' }}
+        if: ${{ inputs.ai_per_file_mode == 'off' && steps.diff.outputs.diff_empty != 'true' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           JSON_CONTEXT: ${{ steps.ctx_out.outputs.json }}
