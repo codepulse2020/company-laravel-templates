@@ -129,7 +129,7 @@ on:
         description: "僅審查特定副檔名（逗號分隔，空白=不篩選）。例如：php,js,ts"
         required: false
         type: string
-        default: "php"
+        default: "php,js,ts"
       ai_request_timeout_sec:
         description: "單次 AI 呼叫的逾時秒數（curl 層）"
         required: false
@@ -149,7 +149,7 @@ on:
         description: "AI 回應最大 tokens 上限（對應新參數 max_completion_tokens）"
         required: false
         type: string
-        default: "2000"
+        default: "5000"
       ai_validate_key:
         description: "在執行 AI 稽核前先做健康檢查（確認 OPENAI_API_KEY 與連線可用）"
         required: false
@@ -818,12 +818,14 @@ jobs:
           FILES_SEL=""
           COUNT=0
           if [ -n "$FILES_ALL" ]; then
+            # 正規化副檔名過濾清單（小寫、去空白、前後加逗號便於比對）
+            FILTER_NORM=$(echo ",$EXT_FILTER," | tr 'A-Z' 'a-z' | tr -d ' ')
             IFS=$'\n'
             for f in $FILES_ALL; do
-              # 副檔名篩選
+              # 副檔名篩選（當 EXT_FILTER 非空時才啟用）
               if [ -n "$EXT_FILTER" ]; then
-                ext=${f##*.}
-                echo ",$EXT_FILTER," | tr 'A-Z' 'a-z' | grep -q ",$((echo "$ext" | tr 'A-Z' 'a-z'))," || { continue; }
+                ext_lc=$(echo "${f##*.}" | tr 'A-Z' 'a-z')
+                echo "$FILTER_NORM" | grep -q ",$ext_lc," || { continue; }
               fi
               FILES_SEL+="$f\n"
               COUNT=$((COUNT+1))
@@ -964,6 +966,7 @@ jobs:
                 -d @"$REQ" > "$HTTP_CODE" || true
               STATUS=$(cat "$HTTP_CODE")
               rm -f "$HTTP_CODE"
+              echo "$STATUS" > out/ai/$SAFE.status.$IDX
 
               # 解析回應
               CONTENT=$(cat "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null || echo "")
@@ -982,11 +985,55 @@ jobs:
             done
           done
 
-          # Debug 附件：保留請求與回應
+          # 產生彙總回應檔（供 email/下載）
+          # 格式：陣列，列出每個檔案每個區塊的 HTTP 狀態與原始回應片段
+          {
+            echo '['
+            first=1
+            for r in out/ai/*.resp.*.json 2>/dev/null; do
+              [ -e "$r" ] || continue
+              base=$(basename "$r")
+              safe_name=${base%%.resp.*}
+              file_path=$(echo "$safe_name" | sed 's/_/\\_/g') # 無法還原原檔名，僅保留安全名
+              idx=$(echo "$base" | sed -E 's/.*\.resp\.([0-9]+)\.json/\1/')
+              status_file="${r%.resp.*}.status.$idx"
+              http=$(cat "$status_file" 2>/dev/null || echo "")
+              snippet=$(head -c 800 "$r" | jq -Rs .)
+              # 輸出 JSON 物件
+              if [ $first -eq 0 ]; then echo ','; fi
+              first=0
+              echo "{\"safe\":$(printf '%s' "$safe_name" | jq -Rs .),\"chunk\":$idx,\"http_status\":$( [ -n "$http" ] && echo "$http" || echo 'null'),\"response_snippet\":$snippet}"
+            done
+            echo ']'
+          } > ai-response.json
+
+          # 總結摘要（Step Summary）
+          {
+            echo "### AI Review · Per-file Summary"
+            FILE_COUNT=$(echo "$FILES_SEL" | sed '/^$/d' | wc -l | tr -d ' ')
+            echo "- Selected files: $FILE_COUNT"
+            RESP_COUNT=$(ls -1 out/ai/*.resp.*.json 2>/dev/null | wc -l | tr -d ' ')
+            echo "- Responses: $RESP_COUNT"
+            OK=$(grep -h -o '^[0-9][0-9][0-9]$' out/ai/*.status.* 2>/dev/null | awk '$1 ~ /^2/ {c++} END{print c+0}')
+            C4=$(grep -h -o '^[0-9][0-9][0-9]$' out/ai/*.status.* 2>/dev/null | awk '$1 ~ /^4/ {c++} END{print c+0}')
+            C5=$(grep -h -o '^[0-9][0-9][0-9]$' out/ai/*.status.* 2>/dev/null | awk '$1 ~ /^5/ {c++} END{print c+0}')
+            echo "- HTTP status counts: 2xx=$OK, 4xx=$C4, 5xx=$C5"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Debug 附件：保留請求與回應索引
           if [ "${{ inputs.ai_debug }}" = "true" ]; then
-            # 打包索引（列出檔案與區塊）
             ls -1 out/ai | sort > out/ai/_files.list || true
           fi
+
+      - name: Upload AI debug (per-file)
+        if: ${{ inputs.ai_per_file_mode != 'off' && inputs.ai_debug == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-debug
+          if-no-files-found: ignore
+          path: |
+            out/ai
+            ai-response.json
 
       - name: Call OpenAI for AI review
         if: ${{ inputs.ai_per_file_mode == 'off' && steps.diff.outputs.diff_empty != 'true' }}
