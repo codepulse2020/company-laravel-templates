@@ -1437,6 +1437,7 @@ jobs:
           if-no-files-found: ignore
           path: |
             ai-result.json
+            ai-response.json
 
       - name: Upload AI debug bundle (artifact)
         if: ${{ inputs.ai_debug == 'true' }}
@@ -1460,6 +1461,8 @@ jobs:
             echo 'list<<EOF'
             echo 'ai-result.json'
             echo 'ai-report.md'
+            # 如存在，無論是否為 debug 模式，一併附上彙總回應檔
+            [ -f ai-response.json ] && echo 'ai-response.json'
             if [ "${{ inputs.ai_debug }}" = "true" ]; then
               [ -f diff.txt ] && echo 'diff.txt'
               [ -f context.txt ] && echo 'context.txt'
@@ -1467,7 +1470,6 @@ jobs:
               [ -f merged-rules.txt ] && echo 'merged-rules.txt'
               [ -f hints.txt ] && echo 'hints.txt'
               [ -f ai-request.json ] && echo 'ai-request.json'
-              [ -f ai-response.json ] && echo 'ai-response.json'
             fi
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
