@@ -1043,7 +1043,7 @@ jobs:
         if: ${{ inputs.ai_per_file_mode != 'off' && inputs.ai_debug == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ai-review-debug
+          name: ai-review-debug-per-file
           if-no-files-found: ignore
           path: |
             out/ai
