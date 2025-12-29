@@ -813,6 +813,7 @@ jobs:
 
           mkdir -p out/ai
           : > out/ai/_index.tsv
+          : > out/ai/_selected_files.txt
 
           # 準備規則/提示文字（從 JSON 字串解碼回原文）
           RULES_TEXT=$(printf '%s' "$RULES_JSON" | jq -r . 2>/dev/null || echo "")
@@ -820,6 +821,14 @@ jobs:
 
           # 建立檔名清單（依副檔名篩選，限制數量）
           FILES_ALL=$(cat changed-files.txt 2>/dev/null || true)
+          # 若 changed-files.txt 不存在或為空，嘗試從 diff 重新解析檔名
+          if [ -z "$FILES_ALL" ]; then
+            if [ -s diff.txt ]; then
+              FILES_ALL=$(awk '/^\+\+\+ b\//{print substr($0,7)}' diff.txt | sort -u || true)
+              printf '%s\n' "$FILES_ALL" > changed-files.txt || true
+              echo "[ai-review] Rebuilt changed-files.txt from diff (fallback)." >&2
+            fi
+          fi
           FILES_SEL=""
           COUNT=0
           if [ -n "$FILES_ALL" ]; then
@@ -841,21 +850,44 @@ jobs:
             unset IFS
           fi
 
+          # 若依副檔名篩選後仍無檔案可審，嘗試不套用副檔名過濾再挑一次
+          if [ -z "$FILES_SEL" ] && [ -n "$FILES_ALL" ]; then
+            echo "[ai-review] No files after extension filter '$EXT_FILTER'. Retrying without filter..." >&2
+            COUNT=0
+            IFS=$'\n'
+            for f in $FILES_ALL; do
+              FILES_SEL+="$f\n"
+              COUNT=$((COUNT+1))
+              if [ $COUNT -ge $MAX_FILES ]; then break; fi
+            done
+            unset IFS
+          fi
+
           if [ -z "$FILES_SEL" ]; then
             echo "[ai-review] No files selected for per-file review (filter or empty). Skipping." >&2
             # 建立空結果以供後續步驟
             echo '{"violations":[]}' > ai-result.json
+            echo '[]' > ai-response.json
+            {
+              echo "### AI Review · Per-file Summary"
+              echo "- Selected files: 0"
+              echo "- Responses: 0"
+              echo "- HTTP status counts: 2xx=0, 4xx=0, 5xx=0"
+              echo
+              echo "> 提示：本次沒有可審查的檔案。請確認 diff 是否為空、或調整 ai_file_extensions 與 ai_per_file_max_files。"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           # 從整體 diff.txt 擷取指定檔案的 diff 片段
           extract_file_diff() {
             local path="$1"
-            awk -v p=" $path" '
+            # 從整體 diff 中擷取對應單一檔案的 diff 區塊
+            # 使用嚴格比對路徑，避免因空白/通配造成漏判
+            awk -v p="$path" '
               /^diff --git / {print_line=0}
               /^diff --git a\// {
-                # 檢查本段是否對應到目標檔案
-                if ($0 ~ (" diff --git a/" p " b/" p "$")) {print_line=1; print $0; next}
+                if ($0 ~ ("^diff --git a/" p " b/" p "$") ) {print_line=1; print $0; next}
               }
               print_line==1 {print}
             ' diff.txt 2>/dev/null || true
@@ -869,7 +901,22 @@ jobs:
           echo '{"violations":[]}' > ai-result.json
 
           # 逐檔處理
-          echo "$FILES_SEL" | sed '/^$/d' | while IFS= read -r FILE; do
+          # 將選定檔案記錄到索引與摘要
+          echo "$FILES_SEL" | sed '/^$/d' | tee out/ai/_selected_files.txt >/dev/null
+          SEL_COUNT=$(wc -l < out/ai/_selected_files.txt | tr -d ' ')
+          {
+            echo "### AI Review · Selected files"
+            echo "- Count: $SEL_COUNT"
+            echo "- Extension filter: '$EXT_FILTER' (empty means no filter)"
+            echo "- Max files: $MAX_FILES, Max chunks/file: $MAX_CHUNKS, Chunk limit: $CHUNK_LIMIT"
+            echo "<details><summary>List (first 20)</summary>"
+            echo
+            head -n 20 out/ai/_selected_files.txt | sed 's/^/- /'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cat out/ai/_selected_files.txt | while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
             SAFE=$(sanitize "$FILE")
             # 取得 HEAD 版本內容
@@ -1017,7 +1064,7 @@ jobs:
           # 總結摘要（Step Summary）
           {
             echo "### AI Review · Per-file Summary"
-            FILE_COUNT=$(echo "$FILES_SEL" | sed '/^$/d' | wc -l | tr -d ' ')
+            FILE_COUNT=$(wc -l < out/ai/_selected_files.txt | tr -d ' ')
             echo "- Selected files: $FILE_COUNT"
             RESP_COUNT=$(ls -1 out/ai/*.resp.*.json 2>/dev/null | wc -l | tr -d ' ')
             echo "- Responses: $RESP_COUNT"
@@ -1032,6 +1079,10 @@ jobs:
               esac
             done
             echo "- HTTP status counts: 2xx=$OK, 4xx=$C4, 5xx=$C5"
+            if [ "$RESP_COUNT" -eq 0 ]; then
+              echo
+              echo "> 注意：沒有任何 AI 回應檔（*.resp.*.json）。可能原因：無選定檔案、網路/授權問題、或 curl 逾時。請開啟 ai_debug 並檢查 out/ai 目錄內容。"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Debug 附件：保留請求與回應索引
