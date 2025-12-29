@@ -129,7 +129,7 @@ on:
         description: "僅審查特定副檔名（逗號分隔，空白=不篩選）。例如：php,js,ts"
         required: false
         type: string
-        default: "php,js,ts"
+        default: ""
       ai_request_timeout_sec:
         description: "單次 AI 呼叫的逾時秒數（curl 層）"
         required: false
@@ -790,7 +790,7 @@ jobs:
       # 4. 呼叫 OpenAI（或你之後自己的 AI）
       # 4.a 逐檔審查（分批請求）
       - name: Per-file AI review (chunked)
-        if: ${{ inputs.ai_per_file_mode != 'off' && steps.diff.outputs.diff_empty != 'true' }}
+        if: ${{ inputs.ai_per_file_mode != 'off' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RULES_JSON: ${{ steps.rules.outputs.json_rules }}
@@ -828,6 +828,43 @@ jobs:
               printf '%s\n' "$FILES_ALL" > changed-files.txt || true
               echo "[ai-review] Rebuilt changed-files.txt from diff (fallback)." >&2
             fi
+          fi
+
+          # 若仍為空，使用 PR/push 感知的 name-only 計算（避免 diff 內容為空時無法取檔名）
+          if [ -z "$FILES_ALL" ]; then
+            EVENT_NAME='${{ github.event_name }}'
+            if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+              BASE_SHA='${{ github.event.pull_request.base.sha }}'
+              HEAD_SHA='${{ github.event.pull_request.head.sha }}'
+              if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+                git fetch --depth=0 origin "$BASE_SHA" "$HEAD_SHA" || true
+                FILES_ALL=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA" | sort -u || true)
+                [ -n "$FILES_ALL" ] && printf '%s\n' "$FILES_ALL" > changed-files.txt || true
+                [ -n "$FILES_ALL" ] && echo "[ai-review] Built changed-files.txt via PR SHAs." >&2
+              fi
+            elif [ "$EVENT_NAME" = "push" ]; then
+              BEFORE='${{ github.event.before }}'
+              AFTER='${{ github.event.after }}'
+              if [ -n "$BEFORE" ] && [ -n "$AFTER" ]; then
+                git fetch --depth=0 origin "$BEFORE" "$AFTER" || true
+                FILES_ALL=$(git diff --name-only "$BEFORE".."$AFTER" | sort -u || true)
+                [ -n "$FILES_ALL" ] && printf '%s\n' "$FILES_ALL" > changed-files.txt || true
+                [ -n "$FILES_ALL" ] && echo "[ai-review] Built changed-files.txt via push before/after." >&2
+              fi
+            fi
+          fi
+
+          # 再次 fallback：default branch vs HEAD，最後回退到上一提交
+          if [ -z "$FILES_ALL" ]; then
+            DEFAULT_BRANCH='${{ github.event.repository.default_branch }}'
+            if [ -n "$DEFAULT_BRANCH" ]; then
+              git fetch --depth=0 origin "$DEFAULT_BRANCH" || true
+              FILES_ALL=$(git diff --name-only origin/"$DEFAULT_BRANCH"...HEAD | sort -u || true)
+            fi
+            if [ -z "$FILES_ALL" ]; then
+              FILES_ALL=$(git diff --name-only HEAD^..HEAD | sort -u || true)
+            fi
+            [ -n "$FILES_ALL" ] && printf '%s\n' "$FILES_ALL" > changed-files.txt || true
           fi
           FILES_SEL=""
           COUNT=0
@@ -874,7 +911,7 @@ jobs:
               echo "- Responses: 0"
               echo "- HTTP status counts: 2xx=0, 4xx=0, 5xx=0"
               echo
-              echo "> 提示：本次沒有可審查的檔案。請確認 diff 是否為空、或調整 ai_file_extensions 與 ai_per_file_max_files。"
+              echo "> 提示：本次沒有可審查的檔案。請確認 diff 是否為空、或調整 ai_file_extensions 與 ai_per_file_max_files。也可檢查 changed-files.txt 是否為空，或在 caller 設置 ai_file_extensions: '' 關閉副檔名過濾。"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
