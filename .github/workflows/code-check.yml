@@ -1446,14 +1446,11 @@ jobs:
             done < __ctx_index.tsv
           fi
 
-          # Merge heuristic results into ai-result.json (de-duplicate by file+line+rule basic)
+          # Merge heuristic results into ai-result.json (de-duplicate by rule+file+line)
           if [ -s "$TMP_HEUR" ]; then
-            jq -s 'def key(v): ((v.file // "") + ":" + ((v.line|tostring) // "") + ":" + (v.rule // ""));
-                   {violations: ( (.[0].violations // []) + (.[1].violations // []) )
-                     | reduce .[] as $v ( [] ; 
-                         (.[key($v)]? // null) as $k |
-                         if $k==null then . + [$v] | .[key($v)]=1 else . end ) ) } 
-                   | {violations: map(delpaths([["__key"]])) }' \
+            jq -s '{violations: ( [.[].violations // []] 
+                                  | add 
+                                  | unique_by([.rule, (.file // ""), (.line // 0)]) ) }' \
               ai-result.json "$TMP_HEUR" > ai-result.merged.json || echo '{"violations":[]}' > ai-result.merged.json
             mv ai-result.merged.json ai-result.json
           fi
